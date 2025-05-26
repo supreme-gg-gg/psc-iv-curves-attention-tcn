@@ -1,13 +1,11 @@
 import numpy as np
 import torch
-from models.jem import JointEmbeddingModel
+from models.joint_embedding_model import JointEmbeddingModel
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import mean_squared_error, r2_score
 import matplotlib.pyplot as plt
-import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
-import numpy as np
 
 def load_trained_autoencoders(input_dim, curve_dim, emb_dim=5, device='cpu'):
     """Load pretrained autoencoders only"""

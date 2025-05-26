@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.preprocessing import RobustScaler, QuantileTransformer
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -40,18 +40,21 @@ def prepare_data(input_paths, output_paths, test_size=0.2):
 
     scale_factor_I = 150.0 # Adjust this based on domain knowledge / data exploration
 
-    # Apply arcsinh transformation
+    # Apply arcsinh transformation for IV curves
     y_train_arcsinh = np.arcsinh(y_train_raw / scale_factor_I)
     y_test_arcsinh = np.arcsinh(y_test_raw / scale_factor_I)
-
-    # Scale the arcsinh-transformed IV curves
-    output_scaler = StandardScaler()
+    
+    # Use QuantileTransformer for output normalization
+    output_transformer = QuantileTransformer(output_distribution='normal',
+                                          n_quantiles=min(len(y_train_raw), 1000))
 
     # Transform data
     X_train_scaled = input_scaler.fit_transform(X_train_log)
-    y_train_scaled = output_scaler.fit_transform(y_train_arcsinh)
     X_test_scaled = input_scaler.transform(X_test_log)
-    y_test_scaled = output_scaler.transform(y_test_arcsinh)
+    
+    # Transform outputs
+    y_train_scaled = output_transformer.fit_transform(y_train_arcsinh)
+    y_test_scaled = output_transformer.transform(y_test_arcsinh)
     
     print(f"\nAfter scaling:")
     print(f"Inputs - Train: [{X_train_scaled.min():.2f}, {X_train_scaled.max():.2f}]")
@@ -68,7 +71,7 @@ def prepare_data(input_paths, output_paths, test_size=0.2):
     return {
         'train': (X_train_tensor, y_train_tensor),
         'test': (X_test_tensor, y_test_tensor),
-        'scalers': (input_scaler, output_scaler),
+        'scalers': (input_scaler, output_transformer),
         'original_test_data_y': y_test_raw  # Keep original test data for plotting
     }
 
@@ -148,7 +151,7 @@ if __name__ == "__main__":
     plt.title('Distribution of Scaled Input Features')
     plt.xlabel('Value')
     plt.ylabel('Count')
-    plt.legend()
+    # plt.legend()
     
     # IV curves histogram (using a few selected points to avoid overcrowding)
     plt.subplot(2, 1, 2)

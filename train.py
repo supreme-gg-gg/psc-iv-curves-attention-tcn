@@ -5,7 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import RobustScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
-from models.jem import JointEmbeddingModel
+from models.joint_embedding_model import JointEmbeddingModel
 
 def load_data(file_paths):
     """Load and stack data from multiple files"""
