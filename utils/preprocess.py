@@ -1,9 +1,10 @@
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import RobustScaler, QuantileTransformer
+from sklearn.preprocessing import RobustScaler, QuantileTransformer, StandardScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
+from torch.nn.utils.rnn import pad_sequence
 
 def load_data(file_paths):
     """Load and stack data from multiple files"""
@@ -75,6 +76,93 @@ def prepare_data(input_paths, output_paths, test_size=0.2):
         'original_test_data_y': y_test_raw  # Keep original test data for plotting
     }
 
+def preprocess_data(input_paths, output_paths, test_size=0.2, return_masks=True):
+    """
+    Filters out the negative part of each IV curve.
+    Applies scaling to both input and output data.
+    Pads IV curves to allow batching of variable-length sequences.
+    
+    Args:
+        input_paths: List of paths to input data files
+        output_paths: List of paths to output data files
+        test_size: Fraction of data to use for testing
+        return_masks: If True, returns masks for valid (non-padded) regions
+    
+    Returns:
+        Dictionary with:
+        - 'train': (X_train_tensor, padded_y_train_tensor, [mask_train])
+        - 'test': (X_test_tensor, padded_y_test_tensor, [mask_test])
+        - 'scalers': (input_scaler, output_scaler)
+        - 'original_test_y': filtered test IV curves (unscaled, unpadded)
+    """
+    epsilon = 1e-40
+    print("\nSequential Data Loading and Preprocessing:")
+    
+    # Load and split data
+    X_data = load_data(input_paths)
+    y_data = load_data(output_paths)
+    print(f"Raw data ranges:")
+    print(f"  Inputs: [{X_data.min():.2f}, {X_data.max():.2f}]")
+    print(f"  IV Curves: [{y_data.min():.2f}, {y_data.max():.2f}]")
+    
+    X_train_raw, X_test_raw, y_train_raw, y_test_raw = train_test_split(
+        X_data, y_data, test_size=test_size, random_state=42, shuffle=True)
+
+    # Filter and process IV curves
+    def filter_curve(curve):
+        neg_indices = np.where(curve < 0)[0]
+        return curve[:neg_indices[0]+1] if neg_indices.size > 0 else curve
+
+    # Process training data
+    filtered_train = [filter_curve(curve) for curve in y_train_raw]
+    lengths_train = [len(curve) for curve in filtered_train]
+    
+    # Fit scaler on training data
+    output_scaler = StandardScaler()
+    all_train_values = np.concatenate(filtered_train)
+    output_scaler.fit(all_train_values.reshape(-1, 1))
+    
+    # Scale and pad training data
+    scaled_train = [output_scaler.transform(curve.reshape(-1, 1)).flatten() for curve in filtered_train]
+    tensor_train = [torch.tensor(curve, dtype=torch.float32) for curve in scaled_train]
+    padded_y_train = pad_sequence(tensor_train, batch_first=True, padding_value=0.0)
+
+    # Process test data
+    filtered_test = [filter_curve(curve) for curve in y_test_raw]
+    lengths_test = [len(curve) for curve in filtered_test]
+    scaled_test = [output_scaler.transform(curve.reshape(-1, 1)).flatten() for curve in filtered_test]
+    tensor_test = [torch.tensor(curve, dtype=torch.float32) for curve in scaled_test]
+    padded_y_test = pad_sequence(tensor_test, batch_first=True, padding_value=0.0)
+
+    # Create masks if requested
+    if return_masks:
+        mask_train = torch.zeros_like(padded_y_train)
+        mask_test = torch.zeros_like(padded_y_test)
+        for i, length in enumerate(lengths_train):
+            mask_train[i, :length] = 1.0
+        for i, length in enumerate(lengths_test):
+            mask_test[i, :length] = 1.0
+
+    # Process input features
+    X_train_log = np.log10(X_train_raw + epsilon)
+    X_test_log = np.log10(X_test_raw + epsilon)
+    input_scaler = RobustScaler(quantile_range=(5,95))
+    X_train_scaled = input_scaler.fit_transform(X_train_log)
+    X_test_scaled = input_scaler.transform(X_test_log)
+    
+    X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
+    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
+    
+    train_data = (X_train_tensor, padded_y_train, mask_train) if return_masks else (X_train_tensor, padded_y_train, lengths_train)
+    test_data = (X_test_tensor, padded_y_test, mask_test) if return_masks else (X_test_tensor, padded_y_test, lengths_test)
+
+    return {
+        'train': train_data,
+        'test': test_data,
+        'scalers': (input_scaler, output_scaler),
+        'original_test_y': filtered_test
+    }
+
 if __name__ == "__main__":
     train_input_paths = [
         "dataset/Data_10k_sets/Data_10k_rng1/LHS_parameters_m.txt",
@@ -88,89 +176,83 @@ if __name__ == "__main__":
         "dataset/Data_10k_sets/Data_10k_rng3/iV_m.txt"
     ]
     
-    # Prepare data
-    data = prepare_data(train_input_paths, train_output_paths)
-    X_train_tensor, y_train_tensor = data['train']
-    X_test_tensor, y_test_tensor = data['test']
-    input_physical_scaler, output_iv_scaler = data['scalers']
-    y_test_original_scale = data['original_test_data_y'] # For plotting during inference
+    # Process data using the new sequential preprocessing
+    data = preprocess_data(train_input_paths, train_output_paths, return_masks=False)
+    (X_train_tensor, padded_y_train, lengths_train) = data['train']
+    (X_test_tensor, padded_y_test, lengths_test) = data['test']
+    input_scaler, output_scaler = data['scalers']
+    filtered_test = data['original_test_y']
     
-    # Data validation and visualization
-    
-    # Basic statistics
+    # Print basic statistics
     print("\nData Shape Summary:")
     print(f"X_train: {X_train_tensor.shape}")
-    print(f"y_train: {y_train_tensor.shape}")
+    print(f"Padded y_train: {padded_y_train.shape}")
     print(f"X_test: {X_test_tensor.shape}")
-    print(f"y_test: {y_test_tensor.shape}")
+    print(f"Padded y_test: {padded_y_test.shape}")
+    print(f"\nSequence lengths:")
+    print(f"Train - min: {min(lengths_train)}, max: {max(lengths_train)}")
+    print(f"Test - min: {min(lengths_test)}, max: {max(lengths_test)}")
     
-    # Create two separate figures for better visibility
-    # Figure 1: Original diagnostic plots
+    # Create visualization plots
     plt.figure(figsize=(15, 10))
     
-    # Input distribution boxplot
+    # Input feature distributions
     plt.subplot(2, 2, 1)
     sns.boxplot(data=X_train_tensor.numpy())
-    plt.title('Distribution of Scaled Input Features (Train)')
+    plt.title('Distribution of Scaled Input Features')
     plt.xticks(rotation=45)
     
-    # Sample IV curves (original)
+    # Original IV curves (few samples)
     plt.subplot(2, 2, 2)
     for i in range(5):
-        plt.plot(y_test_original_scale[i], alpha=0.7, label=f'Sample {i+1}')
+        plt.plot(filtered_test[i], alpha=0.7, label=f'Sample {i+1}')
     plt.title('Sample Original IV Curves (Test)')
+    plt.xlabel('Index')
+    plt.ylabel('Current Density (A/m^2)')
     plt.legend()
-
-    # Sample IV curves (scaled)
+    
+    # Scaled and padded IV curves
     plt.subplot(2, 2, 3)
     for i in range(5):
-        plt.plot(y_test_tensor.numpy()[i], alpha=0.7, label=f'Sample {i+1}')
-    plt.title('Sample Scaled IV Curves (Test)')
-
-    # Scaling verification
-    plt.subplot(2, 2, 4)
-    sample_idx = np.random.randint(0, len(y_test_tensor))
-    scaled_curve = y_test_tensor[3].numpy()
-    unscaled_curve = output_iv_scaler.inverse_transform(scaled_curve.reshape(1, -1))[0]
-    unscaled_curve = np.sinh(unscaled_curve) * 150.0
-    original_curve = y_test_original_scale[3]
-    plt.plot(original_curve, label='Original', linestyle='--')
-    plt.plot(unscaled_curve, label='Unscaled from scaled', alpha=0.7)
-    plt.title('Scaling Verification')
+        valid_length = lengths_test[i]
+        curve = padded_y_test[i, :valid_length]
+        plt.plot(curve.numpy(), alpha=0.7, label=f'Sample {i+1}')
+    plt.title('Scaled & Padded IV Curves (Test)')
+    plt.xlabel('Index')
+    plt.ylabel('Scaled Current')
     plt.legend()
-    plt.tight_layout()
     
-    # Figure 2: Histogram distributions
-    plt.figure(figsize=(15, 8))
-    
-    # Input features histograms
-    plt.subplot(2, 1, 1)
-    X_train_np = X_train_tensor.numpy()
-    for i in range(X_train_np.shape[1]):
-        plt.hist(X_train_np[:, i], bins=50, alpha=0.5, label=f'Feature {i+1}')
-    plt.title('Distribution of Scaled Input Features')
-    plt.xlabel('Value')
-    plt.ylabel('Count')
-    # plt.legend()
-    
-    # IV curves histogram (using a few selected points to avoid overcrowding)
-    plt.subplot(2, 1, 2)
-    y_train_np = y_train_tensor.numpy()
-    selected_points = [0, y_train_np.shape[1]//2, -1]  # Start, middle, end points
-    for idx in selected_points:
-        plt.hist(y_train_np[:, idx], bins=50, alpha=0.5, 
-                label=f'Current at point {idx}')
-    plt.title('Distribution of Scaled IV Curves at Selected Points')
-    plt.xlabel('Scaled Current')
+    # Sequence length distribution
+    plt.subplot(2, 2, 4)
+    plt.hist(lengths_train, bins=30, alpha=0.5, label='Train')
+    plt.hist(lengths_test, bins=30, alpha=0.5, label='Test')
+    plt.title('Distribution of Sequence Lengths')
+    plt.xlabel('Length')
     plt.ylabel('Count')
     plt.legend()
     
     plt.tight_layout()
     plt.show()
     
-    # Check for potential issues
+    # # Verify scaling pipeline
+    # sample_idx = 0
+    # original = filtered_test[sample_idx]
+    # scaled = padded_y_test[sample_idx, :lengths_test[sample_idx]].numpy()
+    
+    # # Inverse transform the scaled values
+    # unscaled = output_scaler.inverse_transform(scaled.reshape(-1, 1)).flatten()
+    
+    # plt.figure(figsize=(10, 6))
+    # plt.plot(original, label='Original', linestyle='--')
+    # plt.plot(unscaled, label='After inverse transform', alpha=0.7)
+    # plt.title('Scaling Verification')
+    # plt.xlabel('Index')
+    # plt.ylabel('Current Density (A/m^2)')
+    # plt.legend()
+    # plt.grid(True)
+    # plt.show()
+    
+    # Print ranges for quality check
     print("\nData Quality Checks:")
     print(f"Input range: [{X_train_tensor.min():.2f}, {X_train_tensor.max():.2f}]")
-    print(f"Output range: [{y_train_tensor.min():.2f}, {y_train_tensor.max():.2f}]")
-    print(f"Test input range: [{X_test_tensor.min():.2f}, {X_test_tensor.max():.2f}]")
-    print(f"Test output range: [{y_test_tensor.min():.2f}, {y_test_tensor.max():.2f}]")
+    print(f"Scaled IV range (excluding padding): [{padded_y_train[padded_y_train != 0].min():.2f}, {padded_y_train[padded_y_train != 0].max():.2f}]")
