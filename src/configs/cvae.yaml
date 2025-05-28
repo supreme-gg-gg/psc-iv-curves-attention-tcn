@@ -1,0 +1,36 @@
+data:
+  input_paths:
+    - dataset/Data_10k_sets/Data_10k_rng1/LHS_parameters_m.txt
+    - dataset/Data_10k_sets/Data_10k_rng2/LHS_parameters_m.txt
+    - dataset/Data_10k_sets/Data_10k_rng3/LHS_parameters_m.txt
+  output_paths:
+    - dataset/Data_10k_sets/Data_10k_rng1/iV_m.txt
+    - dataset/Data_10k_sets/Data_10k_rng2/iV_m.txt
+    - dataset/Data_10k_sets/Data_10k_rng3/iV_m.txt
+  test_size: 0.2
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+
+training:
+  epochs: 50
+  learning_rate: 2.0e-4
+  max_grad_norm: 1.0
+  save_dir: ./checkpoints/cvae
+  save_interval: 10
+  log_interval: 10
+  early_stopping_patience: 10
+  scheduler_config:
+    name: cosine
+    T_max: 50
+    eta_min: 1.0e-6
+
+model:
+  type: cvae
+  physical_dim: 31
+  va_sweep_dim: 41
+  latent_dim: 20
+  kld_weight: 1.0
+  physics_weight: 0.1
+  monotonicity_weight: 0.7
+  smoothness_weight: 0.3
