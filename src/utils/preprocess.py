@@ -11,8 +11,14 @@ def load_data(file_paths):
     data = [np.loadtxt(p, delimiter=',') for p in file_paths]
     return np.vstack(data)
 
+@DeprecationWarning
 def prepare_data(input_paths, output_paths, test_size=0.2):
-    """Load and preprocess data with robust validation"""
+    """
+    Load and preprocess data with robust validation
+    THIS FUNCTION IS DEPRECATED.
+    This is designed for preprocessing output when the entire curve, including the negative part,
+    is used for training. It also does not consider the varying length of the positive IV curves.
+    """
     print("\nData Loading and Preprocessing:")
     
     # Load raw data
@@ -76,67 +82,191 @@ def prepare_data(input_paths, output_paths, test_size=0.2):
         'original_test_data_y': y_test_raw  # Keep original test data for plotting
     }
 
-def preprocess_data(input_paths, output_paths, test_size=0.2, return_masks=True):
+def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
     """
     Filters out the negative part of each IV curve.
     Applies scaling to both input and output data.
     Pads IV curves to allow batching of variable-length sequences.
+    Appends an EOS token to each sequence.
     
-    Args:
-        input_paths: List of paths to input data files
-        output_paths: List of paths to output data files
-        test_size: Fraction of data to use for testing
-        return_masks: If True, returns masks for valid (non-padded) regions
-    
-    Returns:
-        Dictionary with:
-        - 'train': (X_train_tensor, padded_y_train_tensor, [mask_train])
-        - 'test': (X_test_tensor, padded_y_test_tensor, [mask_test])
+    Returns a dictionary with:
+        - 'train': (X_train_tensor, padded_y_train_tensor, lengths_train, eos_targets_train)
+        - 'test': (X_test_tensor, padded_y_test_tensor, lengths_test, eos_targets_test)
         - 'scalers': (input_scaler, output_scaler)
-        - 'original_test_y': filtered test IV curves (unscaled, unpadded)
+        - 'original_test_y': list of filtered test IV curves (unscaled, unpadded)
+        - 'max_sequence_length': Maximum actual sequence length + 1 (for EOS)
     """
     epsilon = 1e-40
+
     print("\nSequential Data Loading and Preprocessing:")
-    
-    # Load and split data
+    # Load raw data
     X_data = load_data(input_paths)
     y_data = load_data(output_paths)
     print(f"Raw data ranges:")
     print(f"  Inputs: [{X_data.min():.2f}, {X_data.max():.2f}]")
     print(f"  IV Curves: [{y_data.min():.2f}, {y_data.max():.2f}]")
-    
+
+    # Split into train and test sets
     X_train_raw, X_test_raw, y_train_raw, y_test_raw = train_test_split(
         X_data, y_data, test_size=test_size, random_state=42, shuffle=True)
 
-    # Filter and process IV curves
+    # Function to filter each IV curve up to its first negative value (if any)
+    def filter_curve(curve):
+        neg_indices = np.where(curve < 0)[0]
+        if neg_indices.size > 0:
+            return curve[:neg_indices[0]+1]
+        else:
+            return curve
+
+    # Process training IV curves
+    filtered_train = [filter_curve(curve) for curve in y_train_raw]
+    
+    # Fit StandardScaler on all scaled values
+    output_scaler = StandardScaler()
+    all_train_values = np.concatenate(filtered_train)
+    output_scaler.fit(all_train_values.reshape(-1, 1))
+    
+    # Apply StandardScaler and prepare EOS token targets
+    scaled_train_std = []
+    eos_targets_train = []
+    lengths_train = []
+    
+    for curve in filtered_train:
+        scaled_curve = output_scaler.transform(curve.reshape(-1, 1)).flatten()
+        scaled_train_std.append(scaled_curve)
+        
+        # EOS token target: 0 for all data points, 1 for the 'virtual' EOS point
+        # The target for EOS prediction is at the step *after* the last actual data point.
+        eos_target_for_curve = np.zeros(len(scaled_curve) + 1, dtype=np.float32)
+        eos_target_for_curve[len(scaled_curve)] = 1.0 # Set EOS for the very next step
+        eos_targets_train.append(eos_target_for_curve)
+        lengths_train.append(len(scaled_curve)) # Store original length for MSE
+
+    # Convert to tensors and pad
+    tensor_train = [torch.tensor(curve, dtype=torch.float32) for curve in scaled_train_std]
+    padded_y_train = pad_sequence(tensor_train, batch_first=True, padding_value=0.0)
+    
+    # Pad EOS targets
+    max_len_train_actual = max(lengths_train)
+    # The padded EOS target sequence needs to be max_len + 1 because EOS is predicted *after* the last element.
+    padded_eos_targets_train = torch.zeros(len(eos_targets_train), max_len_train_actual + 1, dtype=torch.float32)
+    for i, eos_target in enumerate(eos_targets_train):
+        padded_eos_targets_train[i, :len(eos_target)] = torch.tensor(eos_target)
+
+
+    # Process test IV curves similarly
+    filtered_test = [filter_curve(curve) for curve in y_test_raw]
+    scaled_test_std = []
+    eos_targets_test = []
+    lengths_test = []
+
+    for curve in filtered_test:
+        scaled_curve = output_scaler.transform(curve.reshape(-1, 1)).flatten()
+        scaled_test_std.append(scaled_curve)
+        
+        eos_target_for_curve = np.zeros(len(scaled_curve) + 1, dtype=np.float32)
+        eos_target_for_curve[len(scaled_curve)] = 1.0
+        eos_targets_test.append(eos_target_for_curve)
+        lengths_test.append(len(scaled_curve))
+
+    tensor_test = [torch.tensor(curve, dtype=torch.float32) for curve in scaled_test_std]
+    padded_y_test = pad_sequence(tensor_test, batch_first=True, padding_value=0.0)
+
+    max_len_test_actual = max(lengths_test)
+    padded_eos_targets_test = torch.zeros(len(eos_targets_test), max_len_test_actual + 1, dtype=torch.float32)
+    for i, eos_target in enumerate(eos_targets_test):
+        padded_eos_targets_test[i, :len(eos_target)] = torch.tensor(eos_target)
+
+
+    print(f"\nAfter filtering and scaling (IV Curves):")
+    print(f"  Train IV curves: max length = {max_len_train_actual}, min length = {min(lengths_train)}")
+    print(f"  Test IV curves: max length = {max_len_test_actual}, min length = {min(lengths_test)}")
+
+    # Preprocess input features: logarithm transform then RobustScaler
+    X_train_log = np.log10(X_train_raw + epsilon)
+    X_test_log = np.log10(X_test_raw + epsilon)
+    input_scaler = RobustScaler(quantile_range=(5,95))
+    X_train_scaled = input_scaler.fit_transform(X_train_log)
+    X_test_scaled = input_scaler.transform(X_test_log)
+
+    print(f"\nAfter input scaling:")
+    print(f"  Train inputs: [{X_train_scaled.min():.2f}, {X_train_scaled.max():.2f}]")
+    print(f"  Test inputs: [{X_test_scaled.min():.2f}, {X_test_scaled.max():.2f}]")
+
+    # Convert inputs to torch tensors
+    X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
+    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
+
+    return {
+        'train': (X_train_tensor, padded_y_train, torch.tensor(lengths_train), padded_eos_targets_train),
+        'test': (X_test_tensor, padded_y_test, torch.tensor(lengths_test), padded_eos_targets_test),
+        'scalers': (input_scaler, output_scaler),
+        'original_test_y': filtered_test,
+        'max_sequence_length': max(max_len_train_actual, max_len_test_actual) + 1 # Max length for generation (including EOS)
+    }
+
+def preprocess_data_no_eos(input_paths, output_paths, test_size=0.2, return_masks=True):
+    """
+    Preprocesses data for sequence modeling WITHOUT EOS tokens.
+    Each IV curve is truncated at the first negative value (inclusive),
+    and the model is trained to predict only up to that point.
+    Returns padded tensors and masks/lengths for batching.
+
+    Returns:
+    - 'train': (X_train_tensor, padded_y_train, mask_train, lengths_train)
+    - 'test': (X_test_tensor, padded_y_test, mask_test, lengths_test)
+    - 'scalers': (input_scaler, output_scaler)
+    - 'original_test_y': list of filtered test IV curves (unscaled, unpadded)
+    """
+    epsilon = 1e-40
+    # Load data
+    X_data = load_data(input_paths)
+    y_data = load_data(output_paths)
+
+    if test_size == 1.0:
+        X_test_raw = X_data
+        y_test_raw = y_data
+        X_train_raw = np.empty((0, X_data.shape[1]))
+        y_train_raw = np.empty((0, y_data.shape[1]))
+    else:
+        X_train_raw, X_test_raw, y_train_raw, y_test_raw = train_test_split(
+            X_data, y_data, test_size=test_size, random_state=42, shuffle=True)
+
     def filter_curve(curve):
         neg_indices = np.where(curve < 0)[0]
         return curve[:neg_indices[0]+1] if neg_indices.size > 0 else curve
 
     # Process training data
-    filtered_train = [filter_curve(curve) for curve in y_train_raw]
+    filtered_train = [filter_curve(curve) for curve in y_train_raw] if len(y_train_raw) > 0 else []
     lengths_train = [len(curve) for curve in filtered_train]
-    
-    # Fit scaler on training data
-    output_scaler = StandardScaler()
-    all_train_values = np.concatenate(filtered_train)
-    output_scaler.fit(all_train_values.reshape(-1, 1))
-    
-    # Scale and pad training data
-    scaled_train = [output_scaler.transform(curve.reshape(-1, 1)).flatten() for curve in filtered_train]
-    tensor_train = [torch.tensor(curve, dtype=torch.float32) for curve in scaled_train]
-    padded_y_train = pad_sequence(tensor_train, batch_first=True, padding_value=0.0)
-
     # Process test data
     filtered_test = [filter_curve(curve) for curve in y_test_raw]
     lengths_test = [len(curve) for curve in filtered_test]
+
+    # Fit scaler on all data when test_size=1.0, otherwise just on training data
+    output_scaler = StandardScaler()
+    if test_size == 1.0:
+        all_values = np.concatenate(filtered_test)
+    else:
+        all_values = np.concatenate(filtered_train)
+    output_scaler.fit(all_values.reshape(-1, 1))
+
+    # Scale and pad training data (if any)
+    if len(filtered_train) > 0:
+        scaled_train = [output_scaler.transform(curve.reshape(-1, 1)).flatten() for curve in filtered_train]
+        tensor_train = [torch.tensor(curve, dtype=torch.float32) for curve in scaled_train]
+        padded_y_train = pad_sequence(tensor_train, batch_first=True, padding_value=0.0)
+    else:
+        padded_y_train = torch.empty((0,))
+
+    # Scale and pad test data
     scaled_test = [output_scaler.transform(curve.reshape(-1, 1)).flatten() for curve in filtered_test]
     tensor_test = [torch.tensor(curve, dtype=torch.float32) for curve in scaled_test]
     padded_y_test = pad_sequence(tensor_test, batch_first=True, padding_value=0.0)
 
     # Create masks if requested
     if return_masks:
-        mask_train = torch.zeros_like(padded_y_train)
+        mask_train = torch.zeros_like(padded_y_train) if len(filtered_train) > 0 else torch.empty((0,))
         mask_test = torch.zeros_like(padded_y_test)
         for i, length in enumerate(lengths_train):
             mask_train[i, :length] = 1.0
@@ -144,17 +274,22 @@ def preprocess_data(input_paths, output_paths, test_size=0.2, return_masks=True)
             mask_test[i, :length] = 1.0
 
     # Process input features
-    X_train_log = np.log10(X_train_raw + epsilon)
-    X_test_log = np.log10(X_test_raw + epsilon)
     input_scaler = RobustScaler(quantile_range=(5,95))
-    X_train_scaled = input_scaler.fit_transform(X_train_log)
-    X_test_scaled = input_scaler.transform(X_test_log)
-    
+    if test_size == 1.0:
+        X_test_log = np.log10(X_test_raw + epsilon)
+        X_test_scaled = input_scaler.fit_transform(X_test_log)
+        X_train_scaled = np.empty((0, X_test_scaled.shape[1]))
+    else:
+        X_train_log = np.log10(X_train_raw + epsilon)
+        X_test_log = np.log10(X_test_raw + epsilon)
+        X_train_scaled = input_scaler.fit_transform(X_train_log)
+        X_test_scaled = input_scaler.transform(X_test_log)
+
     X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
     X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
-    
-    train_data = (X_train_tensor, padded_y_train, mask_train) if return_masks else (X_train_tensor, padded_y_train, lengths_train)
-    test_data = (X_test_tensor, padded_y_test, mask_test) if return_masks else (X_test_tensor, padded_y_test, lengths_test)
+
+    train_data = (X_train_tensor, padded_y_train, mask_train, lengths_train) if return_masks else (X_train_tensor, padded_y_train, lengths_train)
+    test_data = (X_test_tensor, padded_y_test, mask_test, lengths_test) if return_masks else (X_test_tensor, padded_y_test, lengths_test)
 
     return {
         'train': train_data,
@@ -177,7 +312,7 @@ if __name__ == "__main__":
     ]
     
     # Process data using the new sequential preprocessing
-    data = preprocess_data(train_input_paths, train_output_paths, return_masks=False)
+    data = preprocess_data_no_eos(train_input_paths, train_output_paths, return_masks=False)
     (X_train_tensor, padded_y_train, lengths_train) = data['train']
     (X_test_tensor, padded_y_test, lengths_test) = data['test']
     input_scaler, output_scaler = data['scalers']

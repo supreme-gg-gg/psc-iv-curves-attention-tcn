@@ -5,8 +5,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
+# from sklearn.decomposition import PCA
+# from sklearn.manifold import TSNE
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from utils.preprocess import preprocess_data_with_masks
 
