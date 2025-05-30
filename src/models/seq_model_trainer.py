@@ -134,6 +134,7 @@ class SeqModelTrainer:
             ax.grid()
 
         plt.tight_layout()
+        plt.savefig('generated_curves.png')
         plt.show()
 
     def save_model(self, save_path: str, scalers: Tuple, params: Dict[str, Any]):
