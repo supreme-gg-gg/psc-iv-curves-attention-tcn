@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import math
+from src.models.seq_model_base import SeqModelBase
 
 class PositionalEncoding(nn.Module):
     """
@@ -15,7 +16,7 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0) # Shape: (1, max_len, d_model) for batch_first
+        pe = pe.unsqueeze(0)  # Shape: (1, max_len, d_model)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
@@ -23,167 +24,156 @@ class PositionalEncoding(nn.Module):
         Args:
             x: Tensor of shape (batch_size, seq_len, d_model)
         """
-        # Add positional encoding to the input.
-        # Ensure pe is broadcastable or matches seq_len.
         return x + self.pe[:, :x.size(1), :]
 
-class TransformerIVModel(nn.Module):
-    def __init__(self, physical_dim, d_model, nhead, num_decoder_layers, dropout=0.1, max_seq_len=100):
+class TransformerIVModel(SeqModelBase):
+    def __init__(self, physical_dim, d_model, nhead, num_decoder_layers, dropout=0.1, max_sequence_length=100, scaled_zero_threshold=0.0):
         super(TransformerIVModel, self).__init__()
         self.d_model = d_model
-        self.max_seq_len = max_seq_len
+        self.max_sequence_length = max_sequence_length
+        self.scaled_zero_threshold = scaled_zero_threshold
 
-        # 1. Embed physical parameters to d_model dimension. This acts as the 'memory' for the decoder.
+        # Embeddings and encodings
         self.physical_embedding = nn.Linear(physical_dim, d_model)
-
-        # 2. Embedding for the input sequence values (current values)
-        # We assume input values are scalars, so we embed them to d_model
         self.value_embedding = nn.Linear(1, d_model)
+        self.pos_encoder = PositionalEncoding(d_model, max_len=max_sequence_length)
+        self.dropout = nn.Dropout(dropout)
+        self.decoder_norm = nn.LayerNorm(d_model)
 
-        # 3. Positional Encoding for the generated sequence
-        # Max_len for PE should be at least max_seq_len from data + 1 (for EOS)
-        self.pos_encoder = PositionalEncoding(d_model, max_len=max_seq_len)
-
-        # 4. Transformer Decoder Layer
-        # Set batch_first=True here, and ensure inputs to TransformerDecoder are also batch_first
-        decoder_layer = nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward=d_model*4, dropout=dropout, batch_first=True)
+        # Transformer decoder
+        decoder_layer = nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward=d_model * 4, dropout=dropout, batch_first=True)
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_decoder_layers)
-
-        # 5. Output projection: predicts value and EOS logit
-        self.output_proj = nn.Linear(d_model, 2) # [value, EOS_logit]
-
-        # 6. Learnable start token for sequence generation
-        # This token will be embedded to d_model. It's a scalar value that gets embedded.
+        self.output_proj = nn.Linear(d_model, 1)
         self.start_token = nn.Parameter(torch.zeros(1))
 
     def generate_square_subsequent_mask(self, sz):
-        """
-        Generates a square mask for the sequence. Used to prevent attention to future tokens.
-        This mask should be (seq_len, seq_len).
-        """
+        """Generate causal mask for decoder's self-attention."""
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-    def forward(self, physical, target_seq=None, lengths=None, eos_targets=None, max_gen_length=None):
+    def forward(self, physical, target_seq=None, lengths=None):
         """
-        Generates IV curve sequences.
-        Args:
-            physical (Tensor): Batch of physical parameters (batch_size, physical_dim)
-            target_seq (Tensor, optional): True target sequence for teacher forcing (batch_size, max_len)
-            lengths (Tensor, optional): True lengths of sequences (batch_size)
-            eos_targets (Tensor, optional): Binary EOS targets (batch_size, max_len+1)
-            max_gen_length (int, optional): Max length for auto-regressive generation (inference)
-        Returns:
-            Tuple: (value_outputs, eos_logits)
+        Forward pass that handles both training and inference modes.
+        During training: Process entire sequence in parallel using teacher forcing.
+        During inference: Generate autoregressively until negative value or max length.
         """
         batch_size = physical.size(0)
         device = physical.device
-
-        # Prepare memory (context) from physical parameters
-        # Shape: (batch_size, physical_dim) -> (batch_size, 1, d_model)
         memory = self.physical_embedding(physical).unsqueeze(1)
 
-        # If target_seq is provided, we use parallel computation (teacher-forced or scheduled sampling)
         if target_seq is not None:
-            max_len = target_seq.size(1) # Actual max length of target data
-
-            # Embed the start token for the batch
-            start_token_embedded = self.value_embedding(self.start_token.expand(batch_size, 1)).unsqueeze(1)
-
-            # Embed the target sequence values
-            target_seq_embedded = self.value_embedding(target_seq.unsqueeze(-1))
-
-            # Concatenate to form the full decoder input sequence
-            decoder_input_seq = torch.cat([start_token_embedded, target_seq_embedded], dim=1)
-
-            # Apply positional encoding
-            decoder_input_seq_with_pos = self.pos_encoder(decoder_input_seq)
-
-            # Create attention mask
-            tgt_mask = self.generate_square_subsequent_mask(max_len + 1).to(device)
-
+            # Training mode - process entire sequence in parallel
+            # Prepare decoder input sequence (shift target right by 1 and prepend start token)
+            start_tokens = self.start_token.expand(batch_size, 1)
+            decoder_input = torch.cat([start_tokens, target_seq[:, :-1]], dim=1)
+            
+            # Embed and add positional encoding
+            decoder_input = self.value_embedding(decoder_input.unsqueeze(-1))
+            decoder_input = self.pos_encoder(decoder_input)
+            decoder_input = self.dropout(decoder_input)
+            
+            # Create causal attention mask
+            tgt_mask = self.generate_square_subsequent_mask(decoder_input.size(1)).to(device)
+            
+            # Forward pass through transformer
             decoder_output = self.transformer_decoder(
-                tgt=decoder_input_seq_with_pos,
+                tgt=decoder_input,
                 memory=memory,
                 tgt_mask=tgt_mask
             )
-
-            combined_preds = self.output_proj(decoder_output)
-
-            value_outputs = combined_preds[:, :-1, 0]
-            eos_logits = combined_preds[:, :, 1]
-
-            return value_outputs, eos_logits
-
-        else:
-            # Inference mode (auto-regressive generation)
-            if max_gen_length is None:
-                max_gen_length = self.max_seq_len
-
-            value_outputs_list = []
-            eos_logits_list = []
-
-            current_decoder_input_seq = self.value_embedding(self.start_token.expand(batch_size, 1)).unsqueeze(1)
-
-            for t in range(max_gen_length):
-                tgt_mask = self.generate_square_subsequent_mask(t + 1).to(device)
-                decoder_input_with_pos = self.pos_encoder(current_decoder_input_seq)
-
-                decoder_output = self.transformer_decoder(
-                    tgt=decoder_input_with_pos,
-                    memory=memory,
-                    tgt_mask=tgt_mask
-                )
-
-                last_token_output = decoder_output[:, -1, :]
-                combined_preds = self.output_proj(last_token_output)
-
-                value_pred = combined_preds[:, 0].unsqueeze(1)
-                eos_logit = combined_preds[:, 1].unsqueeze(1)
-
-                value_outputs_list.append(value_pred)
-                eos_logits_list.append(eos_logit)
-
-                if batch_size == 1 and torch.sigmoid(eos_logit[0]).item() > 0.5:
-                    break
-
-                next_input_embedding = self.value_embedding(value_pred).unsqueeze(1)
-                current_decoder_input_seq = torch.cat([current_decoder_input_seq, next_input_embedding], dim=1)
-
-            value_outputs = torch.cat(value_outputs_list, dim=1)
-            eos_logits = torch.cat(eos_logits_list, dim=1)
-
-            return value_outputs, eos_logits
+            decoder_output = self.decoder_norm(decoder_output)
+            
+            # Project to output space
+            outputs = self.output_proj(decoder_output).squeeze(-1)
+            return outputs
         
-def load_trained_transformer_model(model_path, device):
-    """
-    Load a trained Transformer model with its scalers and parameters.
+        else:
+            # Inference mode - generate autoregressively
+            max_len = self.max_sequence_length if lengths is None else max(lengths)
+            
+            # Start with start token
+            current_token = self.start_token.expand(batch_size, 1)
+            outputs = []
+            
+            for _ in range(max_len):
+                # Embed current sequence
+                decoder_input = self.value_embedding(current_token.unsqueeze(-1))
+                decoder_input = self.pos_encoder(decoder_input)
+                decoder_input = self.dropout(decoder_input)
+                
+                # Generate next token
+                decoder_output = self.transformer_decoder(
+                    tgt=decoder_input,
+                    memory=memory,
+                    tgt_mask=None  # No mask needed during inference as we only attend to past tokens
+                )
+                decoder_output = self.decoder_norm(decoder_output)
+                
+                # Get prediction for next token
+                next_token = self.output_proj(decoder_output[:, -1:]).squeeze(-1)
+                outputs.append(next_token)
+                
+                # Check for termination condition
+                if batch_size == 1 and next_token[0].item() < self.scaled_zero_threshold:
+                    break
+                    
+                # Update input sequence for next iteration
+                current_token = torch.cat([current_token, next_token], dim=1)
+            
+            return torch.cat(outputs, dim=1)
 
-    Args:
-        model_path: Path to the saved model file
-        device: Device to load the model onto
+    def generate_curve_batch(self, physical_input, scalers, device):
+        """
+        Generate IV curves in batch using auto-regressive generation.
+        """
+        self.eval()
+        _, output_scaler = scalers
+        batch_size = physical_input.size(0)
+        with torch.no_grad():
+            generated = self.forward(physical_input, target_seq=None)
+        generated_curves = []
+        lengths = []
+        for i in range(batch_size):
+            seq = generated[i].cpu().numpy()
+            neg_indices = (seq < self.scaled_zero_threshold).nonzero()[0]
+            if len(neg_indices) > 0:
+                length = int(neg_indices[0])
+            else:
+                length = len(seq)
+            lengths.append(length)
+            unscaled = output_scaler.inverse_transform(seq[:length].reshape(-1, 1)).flatten()
+            generated_curves.append(unscaled)
+        return generated_curves, lengths
 
-    Returns:
-        model: Loaded model
-        scalers: Tuple of (input_scaler, output_scaler)
-        max_sequence_length: Max sequence length used during training/generation
-    """
-    checkpoint = torch.load(model_path, map_location=device)
+    def save_model(self, save_path, scalers, params):
+        """Save model state, scalers, and parameters."""
+        save_dict = {
+            "model_state_dict": self.state_dict(),
+            "scalers": scalers,
+            "params": params
+        }
+        if self.max_sequence_length is not None:
+            save_dict["max_sequence_length"] = self.max_sequence_length
+        if self.scaled_zero_threshold is not None:
+            save_dict["scaled_zero_threshold"] = self.scaled_zero_threshold
+        torch.save(save_dict, save_path)
 
-    # Create model with saved parameters
-    params = checkpoint['params']
-    model = TransformerIVModel(
-        physical_dim=params['physical_dim'],
-        d_model=params['d_model'],
-        nhead=params['nhead'],
-        num_decoder_layers=params['num_decoder_layers'],
-        dropout=params['dropout'],
-        max_seq_len=checkpoint['max_sequence_length'] # Pass max_seq_len
-    ).to(device)
-
-    # Load state dict
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-
-    return model, checkpoint['scalers'], checkpoint['max_sequence_length'] # Return max_sequence_length
+    @classmethod
+    def load_model(cls, model_path, device):
+        """Load model from file."""
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        params = checkpoint["params"]
+        max_sequence_length = checkpoint.get("max_sequence_length", None)
+        model = cls(
+            physical_dim=params["physical_dim"],
+            d_model=params["d_model"],
+            nhead=params["nhead"],
+            num_decoder_layers=params["num_decoder_layers"],
+            dropout=params["dropout"],
+            max_sequence_length=max_sequence_length if max_sequence_length is not None else 100,
+            scaled_zero_threshold=params.get("scaled_zero_threshold", 0.0)
+        ).to(device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+        return model, checkpoint["scalers"], max_sequence_length

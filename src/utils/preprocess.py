@@ -5,6 +5,7 @@ from sklearn.preprocessing import RobustScaler, QuantileTransformer, StandardSca
 import matplotlib.pyplot as plt
 import seaborn as sns
 from torch.nn.utils.rnn import pad_sequence
+import random
 
 def load_data(file_paths):
     """Load and stack data from multiple files"""
@@ -291,11 +292,15 @@ def preprocess_data_no_eos(input_paths, output_paths, test_size=0.2, return_mask
     train_data = (X_train_tensor, padded_y_train, mask_train, lengths_train) if return_masks else (X_train_tensor, padded_y_train, lengths_train)
     test_data = (X_test_tensor, padded_y_test, mask_test, lengths_test) if return_masks else (X_test_tensor, padded_y_test, lengths_test)
 
+    # compute the transformed zero threshold for the output scaler
+    scaled_zero_threshold = output_scaler.transform(np.array([[0]]))[0, 0]
+
     return {
         'train': train_data,
         'test': test_data,
         'scalers': (input_scaler, output_scaler),
-        'original_test_y': filtered_test
+        'original_test_y': filtered_test,
+        'threshold': scaled_zero_threshold,
     }
 
 if __name__ == "__main__":
@@ -307,6 +312,8 @@ if __name__ == "__main__":
 
     train_output_paths = [
         "dataset/Data_10k_sets/Data_10k_rng1/iV_m.txt",
+        "dataset/Data_10k_sets/Data_10k_rng2/iV_m.txt",
+        "dataset/Data_10k_sets/Data_10k_rng3/iV_m.txt"
         "dataset/Data_10k_sets/Data_10k_rng2/iV_m.txt",
         "dataset/Data_10k_sets/Data_10k_rng3/iV_m.txt"
     ]
@@ -369,25 +376,25 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show()
     
-    # # Verify scaling pipeline
-    # sample_idx = 0
-    # original = filtered_test[sample_idx]
-    # scaled = padded_y_test[sample_idx, :lengths_test[sample_idx]].numpy()
-    
-    # # Inverse transform the scaled values
-    # unscaled = output_scaler.inverse_transform(scaled.reshape(-1, 1)).flatten()
-    
-    # plt.figure(figsize=(10, 6))
-    # plt.plot(original, label='Original', linestyle='--')
-    # plt.plot(unscaled, label='After inverse transform', alpha=0.7)
-    # plt.title('Scaling Verification')
-    # plt.xlabel('Index')
-    # plt.ylabel('Current Density (A/m^2)')
-    # plt.legend()
-    # plt.grid(True)
-    # plt.show()
-    
     # Print ranges for quality check
     print("\nData Quality Checks:")
     print(f"Input range: [{X_train_tensor.min():.2f}, {X_train_tensor.max():.2f}]")
     print(f"Scaled IV range (excluding padding): [{padded_y_train[padded_y_train != 0].min():.2f}, {padded_y_train[padded_y_train != 0].max():.2f}]")
+
+    # plot original vs new IV curve and the point of EOS
+    sample_idx = random.randint(0, len(filtered_test))
+    plt.figure(figsize=(10, 6))
+    original_curve = filtered_test[sample_idx]
+    scaled_curve = padded_y_test[sample_idx, :lengths_test[sample_idx]].numpy()
+    unscaled_curve = output_scaler.inverse_transform(scaled_curve.reshape(-1, 1)).flatten()
+
+    plt.plot(original_curve, label='Original Curve', linestyle='--')
+    plt.plot(unscaled_curve, label='New Curve (Unscaled)', alpha=0.7)
+    plt.title(f'Original vs. New IV Curve (Sample {sample_idx + 1})')
+    plt.xlabel('Index')
+    plt.ylabel('Current Density (A/m^2)')
+    plt.legend()
+    plt.grid(True)
+    plt.axvline(x=lengths_test[sample_idx] - 1, color='red', linestyle=':', label=f'Crop Point (Index {lengths_test[sample_idx] - 1})')
+    plt.legend()
+    plt.show()
