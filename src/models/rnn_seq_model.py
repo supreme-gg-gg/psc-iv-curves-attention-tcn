@@ -48,37 +48,65 @@ class SeqIVModel(SeqModelBase):
         self.init_input = nn.Parameter(torch.randn(1) * 0.02)
 
     def init_hidden(self, physical):
-        # Initialize hidden state using the physical encoder.
-        h0 = torch.tanh(self.physical_enc(physical))
-        return h0.unsqueeze(0).repeat(self.num_layers, 1, 1)
+        # Initialize hidden state using the physical encoder, accounting for bidirectionality.
+        h0 = torch.tanh(self.physical_enc(physical))  # shape: (batch, hidden_dim)
+        num_directions = 2 if self.lstm.bidirectional else 1
+        # Repeat across layers and directions: (num_layers * num_directions, batch, hidden_dim)
+        return h0.unsqueeze(0).repeat(self.num_layers * num_directions, 1, 1)
 
     def init_cell(self, physical):
-        # Initialize cell state with zeros.
-        return torch.zeros(self.num_layers, physical.size(0), self.hidden_dim, device=physical.device)
+        # Initialize cell state with zeros, accounting for bidirectionality.
+        num_directions = 2 if self.lstm.bidirectional else 1
+        return torch.zeros(self.num_layers * num_directions, physical.size(0), self.hidden_dim, device=physical.device)
 
     def forward(self, physical, target_seq=None, lengths=None, teacher_forcing_ratio=0.5):
         """
         Forward pass for training (teacher forcing) and inference.
-        Args:
-            physical (Tensor): Input physical parameters (batch, physical_dim).
-            target_seq (Tensor, optional): Target sequence for teacher forcing.
-            lengths (Tensor, optional): Lengths of target sequences.
-            teacher_forcing_ratio (float): Probability to use teacher forcing.
-        Returns:
-            Tensor: Generated or predicted sequence values.
         """
         batch_size = physical.size(0)
-        # Determine maximum sequence length for generation.
+        device = physical.device
+
+        # Initialize hidden & cell states
+        hidden = self.init_hidden(physical.to(device))
+        cell = self.init_cell(physical.to(device))
+
+        # Training mode: if full teacher forcing, use parallel LSTM; else scheduled sampling loop
         if target_seq is not None:
             max_len = target_seq.size(1)
-        elif lengths is not None:
+
+            if teacher_forcing_ratio == 1.0:
+                # fast parallel teacher forcing
+                x = target_seq.unsqueeze(-1).to(device)
+                outputs, _ = self.lstm(x, (hidden, cell))
+                outputs = self.layer_norm(outputs)
+                projected = self.current_projection(outputs)
+                preds = self.current_head(projected).squeeze(-1)
+                return preds
+
+            # scheduled sampling: mix ground truth and model predictions
+            inputs = None
+            input_token = self.init_input.expand(batch_size, 1).unsqueeze(1).to(device)
+            sam_outputs = []
+
+            for t in range(max_len):
+                out, (hidden, cell) = self.lstm(input_token, (hidden, cell))
+                out = self.layer_norm(out.squeeze(1))
+                projected = self.current_projection(out)
+                pred = self.current_head(projected)  # shape (batch,1)
+                sam_outputs.append(pred)
+                # decide next input
+                use_teacher = (random.random() < teacher_forcing_ratio)
+                next_in = target_seq[:, t].unsqueeze(1).to(device) if use_teacher else pred
+                input_token = next_in.unsqueeze(1)
+            
+            return torch.cat(sam_outputs, dim=1)
+        
+        # Inference (auto-regressive)
+        if lengths is not None:
             max_len = max(lengths)
         else:
-            max_len = 100
+            max_len = self.max_sequence_length
 
-        device = physical.device
-        hidden = self.init_hidden(physical)
-        cell = self.init_cell(physical)
         # Start with the learned start token.
         input_token = self.init_input.expand(batch_size, 1).unsqueeze(1)
         current_outputs = []

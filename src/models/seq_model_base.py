@@ -9,7 +9,7 @@ class SeqModelBase(nn.Module, ABC):
     """
 
     @abstractmethod
-    def forward(self, physical, target_seq=None, lengths=None):
+    def forward(self, physical, target_seq=None, lengths=None, teacher_forcing_ratio=0.5):
         """
         Forward pass for the sequence model.
         """
