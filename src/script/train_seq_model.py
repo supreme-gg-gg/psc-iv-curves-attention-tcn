@@ -4,7 +4,7 @@ Lightweight training script for sequence models.
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from src.utils.preprocess import preprocess_data_no_eos
+from src.utils.preprocess import preprocess_data_with_eos
 from src.models.seq_model_trainer import SeqModelTrainer
 from src.models.rnn_seq_model import SeqIVModel
 from src.models.transformer_model import TransformerIVModel
@@ -25,21 +25,24 @@ OUTPUT_PATHS = [
 MODEL_TYPE = "TRANSFORMER"  # or "RNN"
 
 # Shared hyperparameters
-PHYSICAL_DIM = 31 
-BATCH_SIZE = 64  # Reduced from 128
-EPOCHS = 50
+PHYSICAL_DIM = 31
+BATCH_SIZE = 64
+EPOCHS = 40
 LR = 1e-4
-TEACHER_FORCING_RATIO = 0.5
+TEACHER_FORCING_RATIO = 1.0
+MAX_SEQ_LEN = 50
+MIN_TF_RATIO = 0.1
+EOS_LOSS_WEIGHT = 1.0
 
 # Transformer hyperparameters - lightweight version
-D_MODEL = 32      # Reduced from 128
-NHEAD = 4         # Reduced from 8 
-NUM_DECODER_LAYERS = 2  # Keep small number of layers
+D_MODEL = 32
+NHEAD = 2
+NUM_DECODER_LAYERS = 3
 DROPOUT_TRANSFORMER = 0.1
 MAX_SEQ_LEN = 50
 
 # RNN hyperparameters
-HIDDEN_DIM = 64   # Reduced from 128
+HIDDEN_DIM = 64
 NUM_LAYERS = 2
 DROPOUT_RNN = 0.2
 
@@ -50,16 +53,17 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load and preprocess data
-    data = preprocess_data_no_eos(INPUT_PATHS, OUTPUT_PATHS)
-    X_train, padded_y_train, mask_train, lengths_train = data['train']
-    X_test, padded_y_test, mask_test, lengths_test = data['test']
-    scaled_zero_threshold = data['threshold']
+    # Load and preprocess data with EOS targets
+    data = preprocess_data_with_eos(INPUT_PATHS, OUTPUT_PATHS)
+    X_train, padded_y_train, mask_train, lengths_train, eos_train = data['train']
+    X_test, padded_y_test, mask_test, lengths_test, _ = data['test']
 
-    train_dataset = TensorDataset(X_train, padded_y_train, mask_train, torch.tensor(lengths_train))
-    test_dataset = TensorDataset(X_test, padded_y_test, mask_test, torch.tensor(lengths_test))
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    # include EOS targets for training
+    train_dataset = TensorDataset(X_train, padded_y_train, mask_train, lengths_train, eos_train)
+    # test does not require EOS targets
+    test_dataset = TensorDataset(X_test, padded_y_test, mask_test, lengths_test)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
     # Initialize model
     if MODEL_TYPE.upper() == "TRANSFORMER":
@@ -69,8 +73,7 @@ def main():
             nhead=NHEAD,
             num_decoder_layers=NUM_DECODER_LAYERS,
             dropout=DROPOUT_TRANSFORMER,
-            max_sequence_length=MAX_SEQ_LEN,
-            scaled_zero_threshold=scaled_zero_threshold
+            max_sequence_length=MAX_SEQ_LEN
         ).to(device)
     else:
         model = SeqIVModel(
@@ -78,8 +81,7 @@ def main():
             hidden_dim=HIDDEN_DIM,
             num_layers=NUM_LAYERS,
             dropout=DROPOUT_RNN,
-            max_sequence_length=MAX_SEQ_LEN,
-            scaled_zero_threshold=scaled_zero_threshold
+            max_sequence_length=MAX_SEQ_LEN
         ).to(device)
 
     # Initialize optimizer and scheduler
@@ -87,16 +89,22 @@ def main():
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', patience=3, factor=0.5, min_lr=1e-5
     )
-    trainer = SeqModelTrainer(model, optimizer, scheduler, device)
+    # Trainer with EOS classifier loss
+    trainer = SeqModelTrainer(
+        model, optimizer, scheduler, device,
+        eos_loss_weight=EOS_LOSS_WEIGHT
+    )
 
-    # Training loop
+    # Training loop with scheduled sampling and efficiency enhancements
     for epoch in range(1, EPOCHS + 1):
-        train_loss = trainer.train_one_epoch(train_loader)
+        current_tf_ratio = max(MIN_TF_RATIO, TEACHER_FORCING_RATIO - (epoch - 1) / (EPOCHS - 1) * (TEACHER_FORCING_RATIO - MIN_TF_RATIO))
+
+        train_loss = trainer.train_one_epoch(train_loader, teacher_forcing_ratio=current_tf_ratio)
         val_loss = trainer.validate_one_epoch(test_loader)
-        print(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
-        
-        # Learning rate scheduling
-        scheduler.step(val_loss)
+        print(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, TF Ratio = {current_tf_ratio:.4f}")
+
+    # Learning rate scheduling
+    scheduler.step(val_loss)
 
     # Save the model
     if MODEL_TYPE == "TRANSFORMER":
@@ -106,8 +114,6 @@ def main():
             "nhead": NHEAD,
             "num_decoder_layers": NUM_DECODER_LAYERS,
             "dropout": DROPOUT_TRANSFORMER,
-            "max_sequence_length": MAX_SEQ_LEN,
-            "scaled_zero_threshold": scaled_zero_threshold
         }
     else:
         params = {
@@ -115,8 +121,6 @@ def main():
             "hidden_dim": HIDDEN_DIM,
             "num_layers": NUM_LAYERS,
             "dropout": DROPOUT_RNN,
-            "max_sequence_length": MAX_SEQ_LEN,
-            "scaled_zero_threshold": scaled_zero_threshold
         }
     
     trainer.save_model(SAVE_PATH, data['scalers'], params)

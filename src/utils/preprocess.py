@@ -99,7 +99,7 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
     """
     epsilon = 1e-40
 
-    print("\nSequential Data Loading and Preprocessing:")
+    print("\nSequential Data Loading and Preprocessing (with EOS):")
     # Load raw data
     X_data = load_data(input_paths)
     y_data = load_data(output_paths)
@@ -113,9 +113,10 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
 
     # Function to filter each IV curve up to its first negative value (if any)
     def filter_curve(curve):
+        """Filter curve including the first negative value, then place EOS token"""
         neg_indices = np.where(curve < 0)[0]
         if neg_indices.size > 0:
-            return curve[:neg_indices[0]+1]
+            return curve[:neg_indices[0] + 1]  # Include the first negative value
         else:
             return curve
 
@@ -137,9 +138,9 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
         scaled_train_std.append(scaled_curve)
         
         # EOS token target: 0 for all data points, 1 for the 'virtual' EOS point
-        # The target for EOS prediction is at the step *after* the last actual data point.
+        # EOS target: Place EOS token after the sequence (including negative value)
         eos_target_for_curve = np.zeros(len(scaled_curve) + 1, dtype=np.float32)
-        eos_target_for_curve[len(scaled_curve)] = 1.0 # Set EOS for the very next step
+        eos_target_for_curve[len(scaled_curve)] = 1.0  # EOS after final value
         eos_targets_train.append(eos_target_for_curve)
         lengths_train.append(len(scaled_curve)) # Store original length for MSE
 
@@ -153,7 +154,6 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
     padded_eos_targets_train = torch.zeros(len(eos_targets_train), max_len_train_actual + 1, dtype=torch.float32)
     for i, eos_target in enumerate(eos_targets_train):
         padded_eos_targets_train[i, :len(eos_target)] = torch.tensor(eos_target)
-
 
     # Process test IV curves similarly
     filtered_test = [filter_curve(curve) for curve in y_test_raw]
@@ -178,10 +178,13 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
     for i, eos_target in enumerate(eos_targets_test):
         padded_eos_targets_test[i, :len(eos_target)] = torch.tensor(eos_target)
 
-
-    print(f"\nAfter filtering and scaling (IV Curves):")
-    print(f"  Train IV curves: max length = {max_len_train_actual}, min length = {min(lengths_train)}")
-    print(f"  Test IV curves: max length = {max_len_test_actual}, min length = {min(lengths_test)}")
+    # Create masks for padded sequences (train & test)
+    mask_train = torch.zeros_like(padded_y_train)
+    mask_test = torch.zeros_like(padded_y_test)
+    for i, l in enumerate(lengths_train):
+        mask_train[i, :l] = 1.0
+    for i, l in enumerate(lengths_test):
+        mask_test[i, :l] = 1.0
 
     # Preprocess input features: logarithm transform then RobustScaler
     X_train_log = np.log10(X_train_raw + epsilon)
@@ -190,25 +193,32 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
     X_train_scaled = input_scaler.fit_transform(X_train_log)
     X_test_scaled = input_scaler.transform(X_test_log)
 
-    print(f"\nAfter input scaling:")
-    print(f"  Train inputs: [{X_train_scaled.min():.2f}, {X_train_scaled.max():.2f}]")
-    print(f"  Test inputs: [{X_test_scaled.min():.2f}, {X_test_scaled.max():.2f}]")
-
     # Convert inputs to torch tensors
     X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
     X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
 
+    # Print diagnostic information
+    print("\nSequence Length Statistics:")
+    print(f"Train - min: {min(lengths_train)}, max: {max(lengths_train)}, mean: {np.mean(lengths_train):.1f}")
+    print(f"Test  - min: {min(lengths_test)}, max: {max(lengths_test)}, mean: {np.mean(lengths_test):.1f}")
+    print(f"\nTarget shapes after padding:")
+    print(f"Train sequences: {padded_y_train.shape}")
+    print(f"Train EOS targets: {padded_eos_targets_train.shape}")
+    print(f"Test sequences: {padded_y_test.shape}")
+    print(f"Test EOS targets: {padded_eos_targets_test.shape}")
+
     return {
-        'train': (X_train_tensor, padded_y_train, torch.tensor(lengths_train), padded_eos_targets_train),
-        'test': (X_test_tensor, padded_y_test, torch.tensor(lengths_test), padded_eos_targets_test),
+        'train': (X_train_tensor, padded_y_train, mask_train, torch.tensor(lengths_train), padded_eos_targets_train),
+        'test': (X_test_tensor, padded_y_test, mask_test, torch.tensor(lengths_test), padded_eos_targets_test),
         'scalers': (input_scaler, output_scaler),
         'original_test_y': filtered_test,
-        'max_sequence_length': max(max_len_train_actual, max_len_test_actual) + 1 # Max length for generation (including EOS)
+        'max_sequence_length': max(max_len_train_actual, max_len_test_actual) + 1  # +1 for EOS position
     }
 
 def preprocess_data_no_eos(input_paths, output_paths, test_size=0.2, return_masks=True):
     """
     Preprocesses data for sequence modeling WITHOUT EOS tokens.
+    Essentially, the first negative value acts like an EOS token added to the end of each sequence.
     Each IV curve is truncated at the first negative value (inclusive),
     and the model is trained to predict only up to that point.
     Returns padded tensors and masks/lengths for batching.
@@ -305,17 +315,15 @@ def preprocess_data_no_eos(input_paths, output_paths, test_size=0.2, return_mask
 
 if __name__ == "__main__":
     train_input_paths = [
-        "dataset/Data_10k_sets/Data_10k_rng1/LHS_parameters_m.txt",
-        "dataset/Data_10k_sets/Data_10k_rng2/LHS_parameters_m.txt",
-        "dataset/Data_10k_sets/Data_10k_rng3/LHS_parameters_m.txt"
+        "../../dataset/Data_10k_sets/Data_10k_rng1/LHS_parameters_m.txt",
+        "../../dataset/Data_10k_sets/Data_10k_rng2/LHS_parameters_m.txt",
+        "../../dataset/Data_10k_sets/Data_10k_rng3/LHS_parameters_m.txt"
     ]
 
     train_output_paths = [
-        "dataset/Data_10k_sets/Data_10k_rng1/iV_m.txt",
-        "dataset/Data_10k_sets/Data_10k_rng2/iV_m.txt",
-        "dataset/Data_10k_sets/Data_10k_rng3/iV_m.txt"
-        "dataset/Data_10k_sets/Data_10k_rng2/iV_m.txt",
-        "dataset/Data_10k_sets/Data_10k_rng3/iV_m.txt"
+        "../../dataset/Data_10k_sets/Data_10k_rng1/iV_m.txt",
+        "../../dataset/Data_10k_sets/Data_10k_rng2/iV_m.txt",
+        "../../dataset/Data_10k_sets/Data_10k_rng3/iV_m.txt",
     ]
     
     # Process data using the new sequential preprocessing
