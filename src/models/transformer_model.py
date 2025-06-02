@@ -34,14 +34,18 @@ class TransformerIVModel(SeqModelBase):
         self.scaled_zero_threshold = scaled_zero_threshold
 
         # Embeddings and encodings
-        self.physical_embedding = nn.Linear(physical_dim, d_model)
+        self.physical_embedding = nn.Sequential(
+            nn.Linear(physical_dim, d_model * 2),
+            nn.ReLU(),
+            nn.Linear(d_model * 2, d_model)
+        )
         self.value_embedding = nn.Linear(1, d_model)
         self.pos_encoder = PositionalEncoding(d_model, max_len=max_sequence_length)
         self.dropout = nn.Dropout(dropout)
         self.decoder_norm = nn.LayerNorm(d_model)
 
         # Transformer decoder
-        decoder_layer = nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward=d_model * 4, dropout=dropout, batch_first=True)
+        decoder_layer = nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward=d_model * 2, dropout=dropout, batch_first=True)
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_decoder_layers)
         self.output_proj = nn.Linear(d_model, 1)
         self.start_token = nn.Parameter(torch.zeros(1))
@@ -52,11 +56,12 @@ class TransformerIVModel(SeqModelBase):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-    def forward(self, physical, target_seq=None, lengths=None):
+    def forward(self, physical, target_seq=None, lengths=None, teacher_forcing_ratio=None):
         """
         Forward pass that handles both training and inference modes.
         During training: Process entire sequence in parallel using teacher forcing.
         During inference: Generate autoregressively until negative value or max length.
+        NOTE Teacher forcing ratio is not used here because we only use ground truth sequences for previous tokens.
         """
         batch_size = physical.size(0)
         device = physical.device
@@ -115,6 +120,8 @@ class TransformerIVModel(SeqModelBase):
                 outputs.append(next_token)
                 
                 # Check for termination condition
+                # we append the first negative token as well before stopping
+                # because that is how we preprocessed the data
                 if batch_size == 1 and next_token[0].item() < self.scaled_zero_threshold:
                     break
                     

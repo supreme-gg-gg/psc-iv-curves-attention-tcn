@@ -245,7 +245,7 @@ def preprocess_data_no_eos(input_paths, output_paths, test_size=0.2, return_mask
     lengths_test = [len(curve) for curve in filtered_test]
 
     # Fit scaler on all data when test_size=1.0, otherwise just on training data
-    output_scaler = StandardScaler()
+    output_scaler = RobustScaler()
     if test_size == 1.0:
         all_values = np.concatenate(filtered_test)
     else:

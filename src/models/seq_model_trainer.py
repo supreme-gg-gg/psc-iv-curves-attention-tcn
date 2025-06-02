@@ -6,6 +6,7 @@ import numpy as np
 from sklearn.metrics import r2_score
 from typing import Dict, Any, Tuple, Type
 from src.models.seq_model_base import SeqModelBase
+import random
 
 class SeqModelTrainer:
     def __init__(self, model: SeqModelBase, optimizer, scheduler=None, device='cpu'):
@@ -14,7 +15,7 @@ class SeqModelTrainer:
         self.scheduler = scheduler
         self.device = device
 
-    def train_one_epoch(self, train_loader):
+    def train_one_epoch(self, train_loader, teacher_forcing_ratio=0.5):
         """Train for one epoch."""
         self.model.train()
         total_loss = 0.0
@@ -29,14 +30,15 @@ class SeqModelTrainer:
                 physical,
                 target_seq=padded_seq,
                 lengths=lengths,
+                teacher_forcing_ratio=teacher_forcing_ratio
             )
-            loss = self.compute_loss(outputs, padded_seq, mask)
+            loss = self.compute_shape_aware_loss(outputs, padded_seq, mask)
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item() * physical.size(0)
         return total_loss / len(train_loader.dataset)
 
-    def validate_one_epoch(self, val_loader):
+    def validate_one_epoch(self, val_loader, teacher_forcing_ratio=0.0):
         """Validate for one epoch."""
         self.model.eval()
         total_loss = 0.0
@@ -51,8 +53,9 @@ class SeqModelTrainer:
                     physical,
                     target_seq=padded_seq,
                     lengths=lengths,
+                    teacher_forcing_ratio=teacher_forcing_ratio
                 )
-                loss = self.compute_loss(outputs, padded_seq, mask)
+                loss = self.compute_shape_aware_loss(outputs, padded_seq, mask)
                 total_loss += loss.item() * physical.size(0)
         return total_loss / len(val_loader.dataset)
 
@@ -70,8 +73,54 @@ class SeqModelTrainer:
         mse = ((outputs - targets) ** 2) * mask
         return mse.sum() / mask.sum()
 
+    @staticmethod
+    def compute_shape_aware_loss(outputs, targets, mask, lambda_shape=0.5, mse_weight=1.0):
+        """
+        Computes a shape-aware loss.
+
+        Args:
+            outputs: Model predictions (batch_size, seq_len)
+            targets: Target values (batch_size, seq_len)
+            mask: Binary mask for valid positions (batch_size, seq_len)
+            lambda_shape: Weighting factor for the shape (derivative) loss component.
+            mse_weight: Weighting factor for the main MSE loss component.
+        """
+        pointwise_mse = ((outputs - targets) ** 2) * mask
+        mse_term = pointwise_mse.sum() / mask.sum()
+
+        # Differential Loss (masked) - First Derivative
+        shape_term = torch.tensor(0.0, device=outputs.device, requires_grad=outputs.requires_grad)
+
+        # Ensure there's at least 2 points to compute difference for shape loss
+        # and that the mask allows for it.
+        if outputs.size(1) > 1 and targets.size(1) > 1:
+            # Calculate derivatives (differences between adjacent points)
+            # outputs/targets shape: (batch_size, seq_len)
+            true_diff = targets[:, 1:] - targets[:, :-1]
+            pred_diff = outputs[:, 1:] - outputs[:, :-1]
+
+            # Mask for the differences: valid if both points in the original pair were valid.
+            # mask shape: (batch_size, seq_len)
+            # diff_mask will have shape (batch_size, seq_len - 1)
+            diff_mask = mask[:, 1:] * mask[:, :-1] # Ensures both points forming the difference are valid
+
+            diff_mask_sum = diff_mask.sum()
+            if diff_mask_sum > 0: # Only compute shape loss if there are valid differences
+                shape_mse = ((pred_diff - true_diff) ** 2) * diff_mask
+                shape_term = shape_mse.sum() / diff_mask_sum
+            # If diff_mask_sum is 0, shape_term remains 0.0 as initialized.
+
+        # Total loss
+        # You might want to log mse_term and shape_term separately during training
+        # to see how each component is behaving.
+        total_loss = mse_weight * mse_term + lambda_shape * shape_term
+        return total_loss # Or return all three for logging: total_loss, mse_term, shape_term
+
     def evaluate(self, test_loader, scalers, include_plots=True):
-        """Evaluate model performance."""
+        """
+        Evaluate model performance.
+        This returns the mean R² score across all samples and optionally plots some generated curves.
+        """
         self.model.eval()
         all_r2_scores = []
         sample_data = []
@@ -106,13 +155,17 @@ class SeqModelTrainer:
         mean_r2 = np.mean(all_r2_scores) if all_r2_scores else float('nan')
         print(f"\nModel Evaluation Summary:")
         print(f"- Mean R² Score: {mean_r2:.4f} ({len(all_r2_scores)} valid samples)")
+
+        # print number of samples with negative R² scores
+        negative_r2_count = sum(1 for r2 in all_r2_scores if r2 < 0)
+        print(f"- Negative R² Scores: {negative_r2_count} samples")
         print(f"- Length mismatches: {length_mismatch_count}/{total_samples} sequences")
 
         if include_plots:
             try:
                 self.plot_generated_curves(sample_data, num_samples_to_plot=4)
-            except Exception as e:
-                print(f"Plotting failed: {e}")
+            except Exception:
+                print("Error occurred while plotting curves.")
 
         return mean_r2, sample_data
     
@@ -121,7 +174,11 @@ class SeqModelTrainer:
         """Plot generated curves against true curves."""
         import matplotlib.pyplot as plt
 
-        num_samples = min(num_samples_to_plot, len(sample_data))
+        # Random sampling of curves to plot
+        if len(sample_data) > num_samples_to_plot:
+            sample_data = random.sample(sample_data, num_samples_to_plot)
+
+        num_samples = len(sample_data)
         fig, axes = plt.subplots(num_samples, 1, figsize=(10, 2 * num_samples), sharex=True)
 
         for i in range(num_samples):
