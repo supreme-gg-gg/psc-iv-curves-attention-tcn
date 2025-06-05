@@ -146,7 +146,7 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
 
     # Convert to tensors and pad
     tensor_train = [torch.tensor(curve, dtype=torch.float32) for curve in scaled_train_std]
-    padded_y_train = pad_sequence(tensor_train, batch_first=True, padding_value=0.0)
+    padded_y_train = pad_sequence(tensor_train, batch_first=True, padding_value=-1.0)
     
     # Pad EOS targets
     max_len_train_actual = max(lengths_train)
@@ -171,7 +171,7 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
         lengths_test.append(len(scaled_curve))
 
     tensor_test = [torch.tensor(curve, dtype=torch.float32) for curve in scaled_test_std]
-    padded_y_test = pad_sequence(tensor_test, batch_first=True, padding_value=0.0)
+    padded_y_test = pad_sequence(tensor_test, batch_first=True, padding_value=-1.0)
 
     max_len_test_actual = max(lengths_test)
     padded_eos_targets_test = torch.zeros(len(eos_targets_test), max_len_test_actual + 1, dtype=torch.float32)
@@ -266,14 +266,14 @@ def preprocess_data_no_eos(input_paths, output_paths, test_size=0.2, return_mask
     if len(filtered_train) > 0:
         scaled_train = [output_scaler.transform(curve.reshape(-1, 1)).flatten() for curve in filtered_train]
         tensor_train = [torch.tensor(curve, dtype=torch.float32) for curve in scaled_train]
-        padded_y_train = pad_sequence(tensor_train, batch_first=True, padding_value=0.0)
+        padded_y_train = pad_sequence(tensor_train, batch_first=True, padding_value=-1.0)
     else:
         padded_y_train = torch.empty((0,))
 
     # Scale and pad test data
     scaled_test = [output_scaler.transform(curve.reshape(-1, 1)).flatten() for curve in filtered_test]
     tensor_test = [torch.tensor(curve, dtype=torch.float32) for curve in scaled_test]
-    padded_y_test = pad_sequence(tensor_test, batch_first=True, padding_value=0.0)
+    padded_y_test = pad_sequence(tensor_test, batch_first=True, padding_value=-1.0)
 
     # Create masks if requested
     if return_masks:

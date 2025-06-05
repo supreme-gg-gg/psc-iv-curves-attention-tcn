@@ -44,6 +44,7 @@ class SeqModelTrainer:
                 lengths=lengths,
                 teacher_forcing_ratio=teacher_forcing_ratio
             )
+            
             # unpack model outputs (seq_preds, eos_logits)
             if isinstance(outputs, tuple):
                 seq_preds, eos_logits = outputs
@@ -55,7 +56,7 @@ class SeqModelTrainer:
             # per-step EOS loss
             if eos_logits is not None and eos_targets is not None and self.eos_loss_weight > 0.0:
                 loss = loss + self.eos_loss_weight * self.compute_eos_bce_loss(eos_logits, eos_targets)
-
+            
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item() * physical.size(0)
@@ -104,7 +105,7 @@ class SeqModelTrainer:
         return total_loss / len(val_loader.dataset)
     
     @staticmethod
-    def compute_eos_bce_loss(eos_logits, eos_targets):
+    def compute_eos_bce_loss(eos_logits, eos_targets, gamma: float = 2.0):
         """
         Compute binary cross-entropy loss for EOS predictions.
         Automatically handles size mismatches by aligning targets to logits timesteps.
@@ -116,13 +117,23 @@ class SeqModelTrainer:
         Returns:
             BCE loss value.
         """
-        # Align targets to eos_logits timesteps if there's a size mismatch
+        # Align targets to eos_logits timesteps
         if eos_targets.size(1) != eos_logits.size(1):
             eos_targets = eos_targets[:, :eos_logits.size(1)]
         
-        # Apply sigmoid to logits and compute BCE loss
-        bce_loss = F.binary_cross_entropy_with_logits(eos_logits, eos_targets.float())
-        return bce_loss
+        # Standard BCE per-element (no reduction)
+        bce = F.binary_cross_entropy_with_logits(
+            eos_logits,
+            eos_targets.float(),
+            reduction='none'
+        )
+        # Compute focal weighting: p_t = prob if target==1 else (1-prob)
+        prob = torch.sigmoid(eos_logits)
+        p_t = prob * eos_targets.float() + (1 - prob) * (1 - eos_targets.float())
+        focal_factor = (1 - p_t) ** gamma
+        # Apply focal factor
+        loss = (focal_factor * bce).mean()
+        return loss
 
     @staticmethod
     def compute_mse_loss(outputs, targets, mask):
@@ -266,13 +277,16 @@ class SeqModelTrainer:
             gen_curve, true_curve, r2, gen_len, true_len = sample_data[i]
             ax = axes[i]
             
-            # Use voltage arrays that match the actual curve lengths
-            gen_voltage = Va[:len(gen_curve)]
-            true_voltage = Va[:len(true_curve)]
-            
-            # Plot each curve with its corresponding voltage array
-            ax.plot(gen_voltage, gen_curve, label=f'Generated (len={gen_len})', color='blue', linewidth=2)
-            ax.plot(true_voltage, true_curve, label=f'True (len={true_len})', color='orange', linewidth=2)
+            # Plot each curve truncated to available Va length
+            gen_n = min(len(gen_curve), len(Va))
+            true_n = min(len(true_curve), len(Va))
+            # Plot generated curve
+            ax.plot(Va[:gen_n], gen_curve[:gen_n], label=f'Generated (len={gen_len})', color='blue', linewidth=2)
+            # Plot true curve
+            ax.plot(Va[:true_n], true_curve[:true_n], label=f'True (len={true_len})', color='orange', linewidth=2)
+            # Ensure x-axis spans full longer of the two
+            max_n = max(gen_n, true_n)
+            ax.set_xlim(0, Va[max_n-1] if max_n > 0 else Va[0])
             
             ax.set_title(f'Sample {i + 1} - R²: {r2:.4f} | Gen: {gen_len}, True: {true_len}')
             ax.legend()

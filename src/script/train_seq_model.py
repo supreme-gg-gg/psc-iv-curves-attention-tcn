@@ -32,7 +32,8 @@ LR = 1e-4
 TEACHER_FORCING_RATIO = 1.0
 MAX_SEQ_LEN = 50
 MIN_TF_RATIO = 0.1
-EOS_LOSS_WEIGHT = 1.0
+EOS_LOSS_WEIGHT = 2.0  # increase emphasis on EOS loss
+WARMUP_EPOCHS = 5  # epochs at full teacher forcing
 
 # Transformer hyperparameters - lightweight version
 D_MODEL = 32
@@ -97,7 +98,13 @@ def main():
 
     # Training loop with scheduled sampling and efficiency enhancements
     for epoch in range(1, EPOCHS + 1):
-        current_tf_ratio = max(MIN_TF_RATIO, TEACHER_FORCING_RATIO - (epoch - 1) / (EPOCHS - 1) * (TEACHER_FORCING_RATIO - MIN_TF_RATIO))
+        # Curriculum: full TF for warmup, then linear decay
+        if epoch <= WARMUP_EPOCHS:
+            current_tf_ratio = 1.0
+        else:
+            decay_epochs = EPOCHS - WARMUP_EPOCHS
+            decayed = (epoch - WARMUP_EPOCHS) / decay_epochs
+            current_tf_ratio = max(MIN_TF_RATIO, 1.0 - decayed * (1.0 - MIN_TF_RATIO))
 
         train_loss = trainer.train_one_epoch(train_loader, teacher_forcing_ratio=current_tf_ratio)
         val_loss = trainer.validate_one_epoch(test_loader)

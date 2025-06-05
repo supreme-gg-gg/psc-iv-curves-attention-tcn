@@ -96,7 +96,7 @@ class TransformerIVModel(SeqModelBase):
             eos_logits = self.eos_head(decoder_output).squeeze(-1)
 
             return outputs, eos_logits
-        
+            
         else:
             # Inference mode - generate autoregressively with EOS prediction
             max_len = self.max_sequence_length if lengths is None else max(lengths)
