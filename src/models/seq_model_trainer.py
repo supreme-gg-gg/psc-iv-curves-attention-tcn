@@ -8,9 +8,11 @@ from sklearn.metrics import r2_score
 from typing import Dict, Any, Tuple, Type
 from src.models.seq_model_base import SeqModelBase
 import random
+import matplotlib.pyplot as plt
+import numpy as np
 
 class SeqModelTrainer:
-    def __init__(self, model: SeqModelBase, optimizer, scheduler=None, device='cpu', eos_loss_weight=0.0):
+    def __init__(self, model: SeqModelBase, optimizer, scheduler=None, device='cpu', eos_loss_weight=1.0):
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -49,12 +51,10 @@ class SeqModelTrainer:
                 seq_preds = outputs
                 eos_logits = None
 
-            loss = self.compute_mse_loss(seq_preds, padded_seq, mask)
+            loss = self.compute_shape_aware_loss(seq_preds, padded_seq, mask)
             # per-step EOS loss
             if eos_logits is not None and eos_targets is not None and self.eos_loss_weight > 0.0:
-                # align targets to eos_logits timesteps
-                eos_t = eos_targets[:, :eos_logits.size(1)]
-                loss = loss + self.eos_loss_weight * self.compute_eos_bce_loss(eos_logits, eos_t)
+                loss = loss + self.eos_loss_weight * self.compute_eos_bce_loss(eos_logits, eos_targets)
 
             loss.backward()
             self.optimizer.step()
@@ -62,23 +62,30 @@ class SeqModelTrainer:
 
         return total_loss / len(train_loader.dataset)
 
-    def validate_one_epoch(self, val_loader, teacher_forcing_ratio=0.0):
+    def validate_one_epoch(self, val_loader):
         """Validate for one epoch."""
         self.model.eval()
         total_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                physical, padded_seq, mask, lengths = batch
+                if len(batch) == 5:
+                    physical, padded_seq, mask, lengths, eos_targets = batch
+                else:
+                    physical, padded_seq, mask, lengths = batch
+                    eos_targets = None
                 physical = physical.to(self.device)
                 padded_seq = padded_seq.to(self.device)
                 mask = mask.to(self.device)
+                if eos_targets is not None:
+                    eos_targets = eos_targets.to(self.device)
                 
                 outputs = self.model(
                     physical,
                     target_seq=padded_seq,
                     lengths=lengths,
-                    teacher_forcing_ratio=teacher_forcing_ratio
+                    teacher_forcing_ratio=0.0
                 )
+
                 # Unpack model outputs (seq_preds, eos_logits)
                 if isinstance(outputs, tuple):
                     seq_preds, eos_logits = outputs
@@ -86,8 +93,12 @@ class SeqModelTrainer:
                     seq_preds = outputs
                     eos_logits = None
                     
-                loss = self.compute_mse_loss(seq_preds, padded_seq, mask) + \
-                    (self.eos_loss_weight * self.compute_eos_bce_loss(eos_logits, padded_seq) if eos_logits is not None else 0.0)
+                loss = self.compute_shape_aware_loss(seq_preds, padded_seq, mask)
+                
+                # Add EOS loss if available
+                if eos_logits is not None and eos_targets is not None and self.eos_loss_weight > 0.0:
+                    loss = loss + self.eos_loss_weight * self.compute_eos_bce_loss(eos_logits, eos_targets)
+                    
                 total_loss += loss.item() * physical.size(0)
         
         return total_loss / len(val_loader.dataset)
@@ -96,14 +107,19 @@ class SeqModelTrainer:
     def compute_eos_bce_loss(eos_logits, eos_targets):
         """
         Compute binary cross-entropy loss for EOS predictions.
+        Automatically handles size mismatches by aligning targets to logits timesteps.
         
         Args:
-            eos_logits: Raw logits from the model (batch_size, seq_len)
-            eos_targets: Binary targets for EOS (batch_size, seq_len)
+            eos_logits: Raw logits from the model (batch_size, seq_len_logits)
+            eos_targets: Binary targets for EOS (batch_size, seq_len_targets)
         
         Returns:
             BCE loss value.
         """
+        # Align targets to eos_logits timesteps if there's a size mismatch
+        if eos_targets.size(1) != eos_logits.size(1):
+            eos_targets = eos_targets[:, :eos_logits.size(1)]
+        
         # Apply sigmoid to logits and compute BCE loss
         bce_loss = F.binary_cross_entropy_with_logits(eos_logits, eos_targets.float())
         return bce_loss
@@ -177,7 +193,7 @@ class SeqModelTrainer:
         length_mismatch_count = 0
 
         with torch.no_grad():
-            for batch in test_loader:
+            for batch_idx, batch in enumerate(test_loader):
                 # During evaluation, we don't need EOS targets
                 physical, padded_seq, mask, lengths, _ = batch
                 physical = physical.to(self.device)
@@ -188,68 +204,84 @@ class SeqModelTrainer:
                 )
                 _, output_scaler = scalers
 
-                # Evaluate using EOS-determined lengths
+                # Evaluate using actual curve lengths
                 for i in range(len(lengths)):
                     total_samples += 1
+
+                    # Get true curve at true length (no padding)
                     true_len = lengths[i].item() if isinstance(lengths[i], torch.Tensor) else lengths[i]
-                    gen_len = gen_lengths[i]
                     true_curve = padded_seq[i, :true_len].cpu().numpy()
                     true_unscaled = output_scaler.inverse_transform(true_curve.reshape(-1, 1)).flatten()
+
+                    # Get generated curve at generated length (already cropped by EOS)
+                    gen_len = gen_lengths[i] if isinstance(gen_lengths[i], (int, float)) else int(gen_lengths[i])
                     gen_curve = generated_curves[i]
 
-                    # Count and report length differences between ground truth and EOS prediction
+                    # Count length mismatches
                     if gen_len != true_len:
                         length_mismatch_count += 1
 
-                    # Use EOS-determined length for evaluation
+                    # Compute R² on minimum length
                     min_len = min(true_len, gen_len)
                     if min_len > 1:
-                        y_true = true_unscaled[:min_len]
-                        y_pred = gen_curve[:min_len]
-                        r2 = r2_score(y_true, y_pred)
+                        y_true_r2 = true_unscaled[:min_len]
+                        y_pred_r2 = gen_curve[:min_len]
+                        r2 = r2_score(y_true_r2, y_pred_r2)
                         all_r2_scores.append(r2)
-                        sample_data.append((y_pred, y_true, r2))
+                        
+                        # Store original length curves for plotting
+                        sample_data.append((gen_curve, true_unscaled, r2, gen_len, true_len))
 
         mean_r2 = np.mean(all_r2_scores) if all_r2_scores else float('nan')
         print(f"\nModel Evaluation Summary:")
         print(f"- Mean R² Score: {mean_r2:.4f} ({len(all_r2_scores)} valid samples)")
-
-        # print number of samples with negative R² scores
+        
         negative_r2_count = sum(1 for r2 in all_r2_scores if r2 < 0)
         print(f"- Negative R² Scores: {negative_r2_count} samples")
-        print(f"- EOS length mismatches: {length_mismatch_count}/{total_samples} sequences")
+        print(f"- EOS length mismatches: {length_mismatch_count}/{total_samples} sequences ({100*length_mismatch_count/total_samples:.1f}%)")
 
         if include_plots:
             try:
                 self.plot_generated_curves(sample_data, num_samples_to_plot=4)
-            except Exception:
-                print("Error occurred while plotting curves.")
+            except Exception as e:
+                print(f"Error plotting generated curves: {e}")
 
         return mean_r2, sample_data
     
     @staticmethod
     def plot_generated_curves(sample_data, num_samples_to_plot=4):
-        """Plot generated curves against true curves."""
-        import matplotlib.pyplot as plt
-
+        """Plot generated curves against true curves at their actual lengths."""
         # Random sampling of curves to plot
         if len(sample_data) > num_samples_to_plot:
             sample_data = random.sample(sample_data, num_samples_to_plot)
 
         num_samples = len(sample_data)
-        fig, axes = plt.subplots(num_samples, 1, figsize=(10, 2 * num_samples), sharex=True)
+        fig, axes = plt.subplots(num_samples, 1, figsize=(10, 2 * num_samples))
+        if num_samples == 1:
+            axes = [axes]
+
+        Va = np.concatenate((np.arange(0, 0.41, 0.1), np.arange(0.425, 1.401, 0.025)))  # applied voltage, V
 
         for i in range(num_samples):
-            gen_curve, true_curve, r2 = sample_data[i]
-            ax = axes[i] if num_samples > 1 else axes
-            ax.plot(gen_curve, label='Generated Curve', color='blue')
-            ax.plot(true_curve, label='True Curve', color='orange')
-            ax.set_title(f'Sample {i + 1} - R²: {r2:.4f}')
+            gen_curve, true_curve, r2, gen_len, true_len = sample_data[i]
+            ax = axes[i]
+            
+            # Use voltage arrays that match the actual curve lengths
+            gen_voltage = Va[:len(gen_curve)]
+            true_voltage = Va[:len(true_curve)]
+            
+            # Plot each curve with its corresponding voltage array
+            ax.plot(gen_voltage, gen_curve, label=f'Generated (len={gen_len})', color='blue', linewidth=2)
+            ax.plot(true_voltage, true_curve, label=f'True (len={true_len})', color='orange', linewidth=2)
+            
+            ax.set_title(f'Sample {i + 1} - R²: {r2:.4f} | Gen: {gen_len}, True: {true_len}')
             ax.legend()
             ax.grid()
+            ax.set_ylabel('Current (A)')
 
+        axes[-1].set_xlabel('Voltage (V)')
         plt.tight_layout()
-        plt.savefig('generated_curves.png')
+        plt.savefig('generated_curves.png', dpi=150, bbox_inches='tight')
         plt.show()
 
     def save_model(self, save_path: str, scalers: Tuple, params: Dict[str, Any]):

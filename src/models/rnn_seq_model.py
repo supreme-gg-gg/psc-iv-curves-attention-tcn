@@ -204,7 +204,7 @@ class SeqIVModel(SeqModelBase):
         Returns:
             Tuple: (loaded model, scalers, max_sequence_length if available)
         """
-        checkpoint = torch.load(model_path, map_location=device)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         params = checkpoint["params"]
         max_sequence_length = checkpoint.get("max_sequence_length", None)
         model = cls(

@@ -56,12 +56,12 @@ def main():
     # Load and preprocess data with EOS targets
     data = preprocess_data_with_eos(INPUT_PATHS, OUTPUT_PATHS)
     X_train, padded_y_train, mask_train, lengths_train, eos_train = data['train']
-    X_test, padded_y_test, mask_test, lengths_test, _ = data['test']
+    X_test, padded_y_test, mask_test, lengths_test, eos_test = data['test']
 
     # include EOS targets for training
     train_dataset = TensorDataset(X_train, padded_y_train, mask_train, lengths_train, eos_train)
     # test does not require EOS targets
-    test_dataset = TensorDataset(X_test, padded_y_test, mask_test, lengths_test)
+    test_dataset = TensorDataset(X_test, padded_y_test, mask_test, lengths_test, eos_test)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 

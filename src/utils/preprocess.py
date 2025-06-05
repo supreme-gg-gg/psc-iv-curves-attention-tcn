@@ -124,7 +124,7 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
     filtered_train = [filter_curve(curve) for curve in y_train_raw]
     
     # Fit StandardScaler on all scaled values
-    output_scaler = StandardScaler()
+    output_scaler = RobustScaler()
     all_train_values = np.concatenate(filtered_train)
     output_scaler.fit(all_train_values.reshape(-1, 1))
     

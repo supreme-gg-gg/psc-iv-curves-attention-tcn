@@ -176,6 +176,7 @@ class TransformerIVModel(SeqModelBase):
                 eos_positions = np.where(eos > 0.5)[0]
                 length = int(eos_positions[0]) + 1 if len(eos_positions) > 0 else len(seq)
                 lengths.append(length)
+                
                 # Convert to actual values
                 unscaled = output_scaler.inverse_transform(seq[:length].reshape(-1, 1)).flatten()
                 gen_curves.append(unscaled)
