@@ -1,84 +1,17 @@
 import numpy as np
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score
-from sklearn.preprocessing import RobustScaler
-from sklearn.model_selection import train_test_split
-from torch.nn.utils.rnn import pad_sequence
 # from sklearn.decomposition import PCA
 # from sklearn.manifold import TSNE
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.nn.functional as F
+from ..utils.preprocess import preprocess_data_with_eos
 
-def load_data(file_paths):
-    """Load and stack data from multiple files"""
-    data = [np.loadtxt(p, delimiter=',') for p in file_paths]
-    return np.vstack(data)
-
-def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2, return_masks=True):
-    """
-    Inline variable-length data preprocessing without EOS tokens.
-    Truncates each IV curve at first negative value and pads for batching.
-    """
-    epsilon = 1e-40
-    # Load and split data
-    X_data = load_data(input_paths)
-    y_data = load_data(output_paths)
-    X_train_raw, X_test_raw, y_train_raw, y_test_raw = train_test_split(
-        X_data, y_data, test_size=test_size, random_state=42, shuffle=True)
-
-    def filter_curve(curve):
-        neg_indices = np.where(curve < 0)[0]
-        return curve[:neg_indices[0]+1] if len(neg_indices) > 0 else curve
-
-    # Filter curves
-    filtered_train = [filter_curve(curve) for curve in y_train_raw]
-    filtered_test  = [filter_curve(curve) for curve in y_test_raw]
-    lengths_train  = [len(c) for c in filtered_train]
-    lengths_test   = [len(c) for c in filtered_test]
-
-    # Fit output scaler
-    output_scaler = RobustScaler()
-    output_scaler.fit(np.concatenate(filtered_train).reshape(-1,1))
-
-    # Scale and pad
-    scaled_train = [output_scaler.transform(c.reshape(-1,1)).flatten() for c in filtered_train]
-    scaled_test  = [output_scaler.transform(c.reshape(-1,1)).flatten() for c in filtered_test]
-    tensor_train = [torch.tensor(c, dtype=torch.float32) for c in scaled_train]
-    tensor_test  = [torch.tensor(c, dtype=torch.float32) for c in scaled_test]
-    padded_y_train = pad_sequence(tensor_train, batch_first=True, padding_value=0.0)
-    padded_y_test  = pad_sequence(tensor_test,  batch_first=True, padding_value=0.0)
-
-    # Masks and EOS targets
-    mask_train = torch.zeros_like(padded_y_train)
-    mask_test  = torch.zeros_like(padded_y_test)
-    eos_targets_train = torch.zeros_like(padded_y_train)
-    eos_targets_test  = torch.zeros_like(padded_y_test)
-    for i, l in enumerate(lengths_train):
-        mask_train[i, :l] = 1.0
-        eos_targets_train[i, l-1] = 1.0
-    for i, l in enumerate(lengths_test):
-        mask_test[i, :l] = 1.0
-        eos_targets_test[i, l-1] = 1.0
-
-    # Preprocess X
-    X_train_log = np.log10(X_train_raw + epsilon)
-    X_test_log  = np.log10(X_test_raw + epsilon)
-    input_scaler = RobustScaler(quantile_range=(5,95))
-    X_train_scaled = input_scaler.fit_transform(X_train_log)
-    X_test_scaled  = input_scaler.transform(X_test_log)
-    X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
-    X_test_tensor  = torch.tensor(X_test_scaled,  dtype=torch.float32)
-
-    return {
-        'train': (X_train_tensor, padded_y_train, mask_train, eos_targets_train),
-        'test':  (X_test_tensor, padded_y_test, mask_test, eos_targets_test),
-        'scalers': (input_scaler, output_scaler),
-        'original_test_y': filtered_test
-    }
 class CVAE(nn.Module):
     def __init__(self, physical_dim, va_sweep_dim, latent_dim, output_iv_dim):
         super(CVAE, self).__init__()
@@ -87,7 +20,7 @@ class CVAE(nn.Module):
         self.latent_dim = latent_dim
         self.output_iv_dim = output_iv_dim  # Should equal va_sweep_dim
 
-        # Simplified Encoder: two Linear layers with ReLU activations
+        # Encoder remains unchanged
         encoder_input_dim = physical_dim + va_sweep_dim
         self.encoder = nn.Sequential(
             nn.Linear(encoder_input_dim, 64),
@@ -98,17 +31,25 @@ class CVAE(nn.Module):
         self.fc_mu = nn.Linear(32, latent_dim)
         self.fc_logvar = nn.Linear(32, latent_dim)
 
-        # Simplified Decoder: hidden layer, curve head, and EOS prediction head
+        # Updated decoder architecture with increased capacity and dropout
         decoder_input_dim = latent_dim + physical_dim
         self.decoder_hidden = nn.Sequential(
-            nn.Linear(decoder_input_dim, 64),
+            nn.Linear(decoder_input_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
             nn.ReLU()
         )
+        # Updated curve prediction head with linear activation for better fitting
         self.decoder_curve = nn.Sequential(
-            nn.Linear(64, output_iv_dim),
-            nn.Tanh()
+            nn.Linear(64, output_iv_dim)
         )
-        self.decoder_eos = nn.Linear(64, output_iv_dim)
+        # Updated EOS head with an extra hidden layer for improved EOS prediction
+        self.decoder_eos = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, output_iv_dim)
+        )
 
     def encode(self, x_physical, y_iv_curve_data):
         # x_physical: (batch_size, physical_dim)
@@ -152,41 +93,9 @@ def physics_constraints_loss(iv_curves):
     
     return monotonicity_loss, smoothness_loss
 
-def loss_function_cvae(reconstructed_y_iv, true_y_iv, mu, logvar, kl_beta=1.0,
-                      physics_weight=0.1, monotonicity_weight=0.7, smoothness_weight=0.3):
-    """CVAE loss function with physics constraints.
-    Args:
-        reconstructed_y_iv: Reconstructed IV curves
-        true_y_iv: True IV curves
-        mu, logvar: Latent space parameters
-        kl_beta: Weight for KL divergence term
-        physics_weight: Overall weight for physics constraints
-        monotonicity_weight: Relative weight for monotonicity within physics constraints
-        smoothness_weight: Relative weight for smoothness within physics constraints
-    """
-    # Reconstruction Loss (Mean Squared Error)
-    mse = nn.functional.mse_loss(reconstructed_y_iv, true_y_iv, reduction='sum')
-
-    # KL Divergence
-    kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    
-    # Physics constraints (apply to both predicted and true curves)
-    mono_loss_pred, smooth_loss_pred = physics_constraints_loss(reconstructed_y_iv)
-    mono_loss_true, smooth_loss_true = physics_constraints_loss(true_y_iv)
-    
-    # Use true curve losses as scaling factors
-    mono_scale = torch.clamp(mono_loss_true, min=1e-6)
-    smooth_scale = torch.clamp(smooth_loss_true, min=1e-6)
-    
-    # Normalized physics losses
-    physics_loss = (physics_weight *
-                   (monotonicity_weight * (mono_loss_pred / mono_scale) +
-                    smoothness_weight * (smooth_loss_pred / smooth_scale)))
-    
-    # Total loss
-    return mse + kl_beta * kld + physics_loss
-
-def loss_function_cvae_masked(reconstructed_y_iv, true_y_iv, mask, eos_logits, eos_targets, mu, logvar, kl_beta=1.0, eos_weight=1.0):
+def loss_function_cvae_masked(reconstructed_y_iv, true_y_iv, mask, eos_logits, eos_targets, mu, logvar, 
+                              kl_beta=1.0, eos_weight=2.0,  # increased EOS weight for stronger EOS learning
+                              monotonicity_weight=0.5, smoothness_weight=0.5, physics_loss_weight=0.2):
     """
     CVAE loss function with physics constraints, masking, and EOS prediction.
     'mask' is a tensor matching true_y_iv with 1 for valid and 0 for padding.
@@ -200,12 +109,20 @@ def loss_function_cvae_masked(reconstructed_y_iv, true_y_iv, mask, eos_logits, e
     # KL Divergence
     kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-    # EOS prediction loss - align sizes if needed
+    # Adjust EOS targets size if needed
     if eos_targets.size(1) != eos_logits.size(1):
         eos_targets = eos_targets[:, :eos_logits.size(1)]
     eos_loss = F.binary_cross_entropy_with_logits(eos_logits, eos_targets.float())
 
-    return mse + kl_beta * kld + eos_weight * eos_loss
+    # Physics constraints (apply to both predicted and true curves)
+    mono_loss_pred, smooth_loss_pred = physics_constraints_loss(reconstructed_y_iv * mask)
+    mono_loss_true, smooth_loss_true = physics_constraints_loss(true_y_iv * mask)
+    mono_scale = torch.clamp(mono_loss_true, min=1e-6)
+    smooth_scale = torch.clamp(smooth_loss_true, min=1e-6)
+    physics_loss = (monotonicity_weight * (mono_loss_pred / mono_scale) +
+                    smoothness_weight * (smooth_loss_pred / smooth_scale))
+
+    return mse + kl_beta * kld + eos_weight * eos_loss + physics_loss_weight * physics_loss
 
 def train_model_epoch(model, train_loader, optimizer, scheduler, epoch_num, device,
                      kl_beta_weight, max_grad_norm=1.0, print_every_n_batches=20):
@@ -359,16 +276,16 @@ def evaluate_model(model, x_test, y_test, input_physical_scaler, output_scaler, 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    # Use test data instead of random samples
-    example_physical_qualities_tensor = x_test[:4].to(device)  # Take first 4 samples for visualization
-    print(f"Test physical qualities for inference: shape {example_physical_qualities_tensor.shape}")
+    # Run evaluation on entire test set
+    all_physical_qualities_tensor = x_test.to(device)
+    print(f"Running evaluation on entire test set: {all_physical_qualities_tensor.shape[0]} samples")
 
     # Define number of latent draws per input
     num_latent_draws_per_physics_input = 3
 
-    # Generate IV curves with EOS-based length determination
+    # Generate IV curves with EOS-based length determination for entire test set
     generated_curves, generated_lengths = generate_iv_curves_from_scaled_physical_quantities(
-        model, example_physical_qualities_tensor, device,
+        model, all_physical_qualities_tensor, device,
         num_latent_samples_per_input=num_latent_draws_per_physics_input
     )
     print(f"Generated curves: {len(generated_curves)} examples with variable lengths")
@@ -378,43 +295,46 @@ def evaluate_model(model, x_test, y_test, input_physical_scaler, output_scaler, 
     for i, sample_curves in enumerate(generated_curves):
         sample_unscaled = []
         for j, curve in enumerate(sample_curves):
-            # curve is already cropped to EOS length, just inverse transform
             curve_unscaled = output_scaler.inverse_transform(curve.reshape(-1, 1)).flatten()
             sample_unscaled.append(curve_unscaled)
         generated_iv_curves_unscaled.append(sample_unscaled)
 
-    # Plot comparison between true and generated curves
+    # Randomly select 4 samples for plotting
+    total_samples = len(generated_iv_curves_unscaled)
+    plot_indices = random.sample(range(total_samples), 4) if total_samples >= 4 else list(range(total_samples))
+
     plt.figure(figsize=(16, 12))
     V_a = np.concatenate((np.arange(0, 0.41, 0.1), np.arange(0.425, 1.401, 0.025)))
     
-    for i in range(4):  # Loop through the first 4 test samples
-        true_curve = y_test_original_scale[i]
-        plt.subplot(2, 2, i + 1)  # Create a 2x2 grid of subplots
+    for idx, sample_idx in enumerate(plot_indices):
+        true_curve = y_test_original_scale[sample_idx]
+        plt.subplot(2, 2, idx + 1)
         plt.plot(V_a[:len(true_curve)], true_curve, 'k-', label='True IV Curve', linewidth=2)
         
         for j in range(num_latent_draws_per_physics_input):
-            gen_curve = generated_iv_curves_unscaled[i][j]
+            gen_curve = generated_iv_curves_unscaled[sample_idx][j]
             plt.plot(V_a[:len(gen_curve)], gen_curve,
                      label=f'Generated {j+1}', linestyle='--', alpha=0.6)
         
         plt.xlabel('Applied Voltage (V)')
         plt.ylabel('Current Density (A/m^2)')
-        plt.title(f'Test Sample {i + 1}: True vs Generated IV Curves')
+        plt.title(f'Test Sample {sample_idx}: True vs Generated IV Curves')
         plt.legend(loc='best')
         plt.grid(True)
     
     plt.tight_layout()
     plt.savefig("model_evaluation_subplots.png")
+    print("Saved evaluation plot to model_evaluation_subplots.png")
 
-    # R² computation using EOS-determined lengths
-    n_test = min(len(y_test_original_scale), len(generated_iv_curves_unscaled))
+    # R² computation using EOS-determined lengths for the entire test set
+    n_test = len(y_test_original_scale)
+    print("Number of test samples:", n_test)
     r2_scores = []
     for i in range(n_test):
         true_curve = y_test_original_scale[i]
         r2_sample_scores = []
         for j in range(num_latent_draws_per_physics_input):
             pred_curve = generated_iv_curves_unscaled[i][j]
-            # Use minimum length for comparison
             min_len = min(len(true_curve), len(pred_curve))
             if min_len > 1:
                 r2_sample_scores.append(r2_score(true_curve[:min_len], pred_curve[:min_len]))
@@ -471,11 +391,11 @@ def main():
 
     # Create DataLoader instances with masks and EOS targets
     train_dataset = TensorDataset(X_train_tensor, y_train_tensor, train_mask_tensor, eos_targets_train)
-    train_loader = DataLoader(train_dataset, batch_size=training_batch_size, shuffle=True,
+    train_loader = DataLoader(train_dataset, batch_size=training_batch_size, shuffle=True, num_workers=2,
                             pin_memory=(device.type == 'cuda'))
 
     test_dataset = TensorDataset(X_test_tensor, y_test_tensor, test_mask_tensor, eos_targets_test)
-    test_loader = DataLoader(test_dataset, batch_size=training_batch_size, shuffle=False,
+    test_loader = DataLoader(test_dataset, batch_size=training_batch_size, shuffle=False, num_workers=2,
                            pin_memory=(device.type == 'cuda'))
 
     # 2. Initialize model and optimizer

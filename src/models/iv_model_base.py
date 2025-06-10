@@ -2,14 +2,14 @@ import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
 
-class SeqModelBase(nn.Module, ABC):
+class IVModelBase(nn.Module, ABC):
     """
-    Base class for sequence models to enforce a common interface.
-    Both RNN and Transformer models should implement this interface.
+    Base class for sequence generation models to enforce a common interface.
+    Models such as Transformer, RNN, VAE, MLP should all inherit from this class.
     """
 
     @abstractmethod
-    def forward(self, physical, target_seq=None, lengths=None, teacher_forcing_ratio=0.5):
+    def forward(self, physical, target_seq=None, lengths=None, teacher_forcing_ratio=None):
         """
         Forward pass for the sequence model.
         
@@ -17,7 +17,7 @@ class SeqModelBase(nn.Module, ABC):
             physical (Tensor): Input physical parameters (batch_size, physical_dim)
             target_seq (Tensor, optional): Target sequence for teacher forcing (batch_size, seq_len)
             lengths (list[int], optional): Actual lengths of each sequence in batch
-            teacher_forcing_ratio (float, optional): Probability of using teacher forcing (0 to 1)
+            teacher_forcing_ratio (float, optional): Probability of using teacher forcing (0 to 1), only applies to sequence models
             
         Returns:
             Training mode (when target_seq is provided):

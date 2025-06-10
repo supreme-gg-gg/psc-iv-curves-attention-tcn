@@ -6,13 +6,13 @@ import torch.nn.functional as F
 import numpy as np
 from sklearn.metrics import r2_score
 from typing import Dict, Any, Tuple, Type
-from src.models.seq_model_base import SeqModelBase
+from src.models.iv_model_base import IVModelBase 
 import random
 import matplotlib.pyplot as plt
 import numpy as np
 
 class SeqModelTrainer:
-    def __init__(self, model: SeqModelBase, optimizer, scheduler=None, device='cpu', eos_loss_weight=1.0):
+    def __init__(self, model: IVModelBase, optimizer, scheduler=None, device='cpu', eos_loss_weight=1.0):
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -209,7 +209,7 @@ class SeqModelTrainer:
                 physical, padded_seq, mask, lengths, _ = batch
                 physical = physical.to(self.device)
                 
-                # Get generated sequences with EOS-based lengths
+                # Get generated sequences with truncation-based lengths
                 generated_curves, gen_lengths = self.model.generate_curve_batch(
                     physical, scalers, self.device
                 )
@@ -224,7 +224,7 @@ class SeqModelTrainer:
                     true_curve = padded_seq[i, :true_len].cpu().numpy()
                     true_unscaled = output_scaler.inverse_transform(true_curve.reshape(-1, 1)).flatten()
 
-                    # Get generated curve at generated length (already cropped by EOS)
+                    # Get generated curve at generated length (already cropped by truncation logic)
                     gen_len = gen_lengths[i] if isinstance(gen_lengths[i], (int, float)) else int(gen_lengths[i])
                     gen_curve = generated_curves[i]
 
@@ -249,7 +249,7 @@ class SeqModelTrainer:
         
         negative_r2_count = sum(1 for r2 in all_r2_scores if r2 < 0)
         print(f"- Negative R² Scores: {negative_r2_count} samples")
-        print(f"- EOS length mismatches: {length_mismatch_count}/{total_samples} sequences ({100*length_mismatch_count/total_samples:.1f}%)")
+        print(f"- Length mismatches: {length_mismatch_count}/{total_samples} sequences ({100*length_mismatch_count/total_samples:.1f}%)")
 
         if include_plots:
             try:
@@ -303,6 +303,6 @@ class SeqModelTrainer:
         self.model.save_model(save_path, scalers, params)
 
     @staticmethod
-    def load_model(model_class: Type[SeqModelBase], model_path: str, device: str = 'cpu'):
+    def load_model(model_class: Type[IVModelBase], model_path: str, device: str = 'cpu'):
         """Load model through the model class's load_model implementation."""
         return model_class.load_model(model_path, device)

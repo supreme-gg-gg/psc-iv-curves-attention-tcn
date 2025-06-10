@@ -137,21 +137,18 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
         scaled_curve = output_scaler.transform(curve.reshape(-1, 1)).flatten()
         scaled_train_std.append(scaled_curve)
         
-        # EOS token target: 0 for all data points, 1 for the 'virtual' EOS point
-        # EOS target: Place EOS token after the sequence (including negative value)
-        eos_target_for_curve = np.zeros(len(scaled_curve) + 1, dtype=np.float32)
-        eos_target_for_curve[len(scaled_curve)] = 1.0  # EOS after final value
+        # EOS token target: mark EOS at the last actual data point (inclusive)
+        eos_target_for_curve = np.zeros(len(scaled_curve), dtype=np.float32)
+        eos_target_for_curve[-1] = 1.0  # EOS at final value point
         eos_targets_train.append(eos_target_for_curve)
-        lengths_train.append(len(scaled_curve)) # Store original length for MSE
+        lengths_train.append(len(scaled_curve)) # Number of timesteps (sequence length)
 
     # Convert to tensors and pad
     tensor_train = [torch.tensor(curve, dtype=torch.float32) for curve in scaled_train_std]
     padded_y_train = pad_sequence(tensor_train, batch_first=True, padding_value=-1.0)
-    
-    # Pad EOS targets
+    # Pad EOS targets to the same sequence length
     max_len_train_actual = max(lengths_train)
-    # The padded EOS target sequence needs to be max_len + 1 because EOS is predicted *after* the last element.
-    padded_eos_targets_train = torch.zeros(len(eos_targets_train), max_len_train_actual + 1, dtype=torch.float32)
+    padded_eos_targets_train = torch.zeros(len(eos_targets_train), max_len_train_actual, dtype=torch.float32)
     for i, eos_target in enumerate(eos_targets_train):
         padded_eos_targets_train[i, :len(eos_target)] = torch.tensor(eos_target)
 
@@ -165,8 +162,9 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
         scaled_curve = output_scaler.transform(curve.reshape(-1, 1)).flatten()
         scaled_test_std.append(scaled_curve)
         
-        eos_target_for_curve = np.zeros(len(scaled_curve) + 1, dtype=np.float32)
-        eos_target_for_curve[len(scaled_curve)] = 1.0
+        # mark EOS at last data point
+        eos_target_for_curve = np.zeros(len(scaled_curve), dtype=np.float32)
+        eos_target_for_curve[-1] = 1.0
         eos_targets_test.append(eos_target_for_curve)
         lengths_test.append(len(scaled_curve))
 
@@ -174,7 +172,7 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
     padded_y_test = pad_sequence(tensor_test, batch_first=True, padding_value=-1.0)
 
     max_len_test_actual = max(lengths_test)
-    padded_eos_targets_test = torch.zeros(len(eos_targets_test), max_len_test_actual + 1, dtype=torch.float32)
+    padded_eos_targets_test = torch.zeros(len(eos_targets_test), max_len_test_actual, dtype=torch.float32)
     for i, eos_target in enumerate(eos_targets_test):
         padded_eos_targets_test[i, :len(eos_target)] = torch.tensor(eos_target)
 
@@ -197,6 +195,8 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
     X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
     X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
 
+    scaled_zero_threshold = output_scaler.transform(np.array([[0]]))[0, 0]
+
     # Print diagnostic information
     print("\nSequence Length Statistics:")
     print(f"Train - min: {min(lengths_train)}, max: {max(lengths_train)}, mean: {np.mean(lengths_train):.1f}")
@@ -212,7 +212,8 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
         'test': (X_test_tensor, padded_y_test, mask_test, torch.tensor(lengths_test), padded_eos_targets_test),
         'scalers': (input_scaler, output_scaler),
         'original_test_y': filtered_test,
-        'max_sequence_length': max(max_len_train_actual, max_len_test_actual) + 1  # +1 for EOS position
+        'max_sequence_length': max(max_len_train_actual, max_len_test_actual),
+        'threshold': scaled_zero_threshold,
     }
 
 def preprocess_data_no_eos(input_paths, output_paths, test_size=0.2, return_masks=True):
