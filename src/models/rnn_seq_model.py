@@ -22,7 +22,14 @@ class RNNIVModel(IVModelBase):
         **kwargs: Additional keyword arguments for future extensibility.
     """
 
-    def __init__(self, physical_dim, hidden_dim, num_layers=2, dropout=0.2, max_sequence_length=100, eos_threshold=0.5, **kwargs):
+    def __init__(self, physical_dim, 
+                 hidden_dim, 
+                 voltage_points=None,
+                 num_layers=2, 
+                 dropout=0.2, 
+                 max_sequence_length=100, 
+                 eos_threshold=0.5, 
+                 **kwargs):
         super(RNNIVModel, self).__init__()
         self.physical_dim = physical_dim
         self.hidden_dim = hidden_dim
@@ -31,19 +38,22 @@ class RNNIVModel(IVModelBase):
         # threshold for EOS prediction
         self.eos_threshold = eos_threshold
 
+        # voltage points for IV curve generation
+        self.voltage_points = voltage_points if voltage_points is not None else np.concatenate((np.arange(0, 0.41, 0.1), np.arange(0.425, 1.401, 0.025)))
+
         # Encoder: enhanced physical features encoder with layer norm
         self.physical_enc = nn.Sequential(
-            nn.Linear(physical_dim, hidden_dim * 2, bias=True),
+            nn.Linear(physical_dim, hidden_dim * 2),
             nn.LayerNorm(hidden_dim * 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim, bias=True),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.LayerNorm(hidden_dim)
         )
 
         # LSTM: Bidirectional LSTM with residual connections
         self.lstm = nn.LSTM(
-            input_size=1,
+            input_size=2,
             hidden_size=hidden_dim,
             num_layers=num_layers,
             batch_first=True,
@@ -55,13 +65,8 @@ class RNNIVModel(IVModelBase):
         self.layer_norm = nn.LayerNorm(hidden_dim * 2)  # *2 for bidirectionality
 
         # Prediction head: Project and predict the output value with a residual pathway
-        self.current_projection = nn.Linear(hidden_dim * 2, hidden_dim, bias=True)
-        self.current_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim, bias=True),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1, bias=True)
-        )
+        self.current_projection = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.current_head = nn.Linear(hidden_dim, 1, bias=True)  # Predict single value per timestep
         # EOS head for end-of-sequence prediction (auxiliary)
         self.eos_head = nn.Linear(hidden_dim, 1, bias=True)
 
@@ -80,16 +85,32 @@ class RNNIVModel(IVModelBase):
         num_directions = 2 if self.lstm.bidirectional else 1
         return torch.zeros(self.num_layers * num_directions, physical.size(0), self.hidden_dim, device=physical.device)
 
+    def _rnn_step(self, input_token, hidden, cell):
+        """
+        Single LSTM step: returns prediction, EOS logit, and updated hidden/cell.
+        """
+        out, (hidden, cell) = self.lstm(input_token, (hidden, cell))
+        out_norm = self.layer_norm(out.squeeze(1))
+        proj = self.current_projection(out_norm)
+        pred = self.current_head(proj)
+        eos = self.eos_head(proj)
+        return pred, eos, hidden, cell
+
     def forward(self, physical, target_seq=None, lengths=None, teacher_forcing_ratio=0.5):
         """
         Forward pass for training (teacher forcing) and inference.
         """
         batch_size = physical.size(0)
         device = physical.device
+        # expand voltage_points to shape [batch_size, T, 1]
+        volt_seq = self.voltage_points.to(device).unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, 1)
 
         # Initialize hidden & cell states
         hidden = self.init_hidden(physical.to(device))
         cell = self.init_cell(physical.to(device))
+
+        # cache start token
+        init_token = self.init_input.expand(batch_size, 1, 1).to(device)
 
         # Training mode: if full teacher forcing, use parallel LSTM; else scheduled sampling loop
         if target_seq is not None:
@@ -97,7 +118,10 @@ class RNNIVModel(IVModelBase):
 
             if teacher_forcing_ratio == 1.0:
                 # fast parallel teacher forcing
-                x = target_seq.unsqueeze(-1).to(device)
+                x = torch.cat([
+                    target_seq.to(device).unsqueeze(-1),      # [B,T,1]
+                    volt_seq                     # [B,T,1]
+                ], dim=-1)                       # → [B,T,2]
                 outputs, _ = self.lstm(x, (hidden, cell))
                 outputs = self.layer_norm(outputs)
                 projected = self.current_projection(outputs)
@@ -109,27 +133,29 @@ class RNNIVModel(IVModelBase):
             # scheduled sampling: mix ground truth and model predictions
             sam_outputs = []
             sam_eos = []
-            
-            # Initialize input token with learned start token [batch, 1, 1]
-            input_token = self.init_input.expand(batch_size, 1, 1).to(device)
+            # vectorized decisions per time-step
+            teacher_mask = torch.rand(batch_size, max_len, device=device) < teacher_forcing_ratio
+
+            # Initialize input token with learned start token and first voltage
+            input_token = torch.cat([init_token, volt_seq[:, 0:1]], dim=-1)
             
             for t in range(max_len):
-                out, (hidden, cell) = self.lstm(input_token, (hidden, cell))
-                out = self.layer_norm(out.squeeze(1))
-                projected = self.current_projection(out)
-                pred = self.current_head(projected)  # shape (batch,1)
+                # run one step
+                pred, eos, hidden, cell = self._rnn_step(input_token, hidden, cell)
                 sam_outputs.append(pred)
-                # per-step EOS logit
-                sam_eos.append(self.eos_head(projected))
-                # decide next input
-                use_teacher = (random.random() < teacher_forcing_ratio)
-                if use_teacher:
-                    # [batch] -> [batch, 1, 1]
-                    input_token = target_seq[:, t].unsqueeze(1).unsqueeze(-1).to(device)
+                sam_eos.append(eos)
+
+                # prepare next current: either ground truth or model prediction
+                if teacher_mask[:, t].all():
+                    next_curr = target_seq[:, t].view(batch_size, 1, 1)
                 else:
-                    # pred is [batch, 1] -> [batch, 1, 1]
-                    input_token = pred.unsqueeze(-1)
-            
+                    gt = target_seq[:, t].view(batch_size, 1, 1)
+                    next_curr = torch.where(teacher_mask[:, t].view(batch_size, 1, 1), gt, pred.unsqueeze(-1))
+
+                # attach next voltage (or zero padding)
+                v_next = volt_seq[:, t+1:t+2] if t+1 < max_len else torch.zeros_like(init_token)
+                input_token = torch.cat([next_curr, v_next], dim=-1)
+
             seq_preds = torch.cat(sam_outputs, dim=1)
             # compile EOS logits
             eos_logits = torch.cat(sam_eos, dim=1).squeeze(-1)
@@ -141,33 +167,33 @@ class RNNIVModel(IVModelBase):
         else:
             max_len = self.max_sequence_length
 
-        # Start with the learned start token [batch, 1, 1]
-        input_token = self.init_input.expand(batch_size, 1, 1).to(device)
+        # Start with the cached init_token
+        input_token = init_token
         value_outputs = []
         eos_outputs = []
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
+        # Inference (auto-regressive) loop
         for t in range(max_len):
-            out, (hidden, cell) = self.lstm(input_token, (hidden, cell))
-            out = self.layer_norm(out.squeeze(1))
-            projected = self.current_projection(out)
-            
-            # Get value and EOS predictions
-            next_token = self.current_head(projected)
-            next_eos = self.eos_head(projected)
-            
+            # run one step
+            next_token, next_eos, hidden, cell = self._rnn_step(input_token, hidden, cell)
+             
             value_outputs.append(next_token)
             eos_outputs.append(next_eos)
-            
+             
             # Update finished flags based on EOS prediction
             eos_prob = torch.sigmoid(next_eos)
             finished = finished | (eos_prob > self.eos_threshold)
             if finished.all():
                 break
-                
-            # next_token is [batch, 1] -> [batch, 1, 1]
-            input_token = next_token.unsqueeze(-1)
-        
+             
+            # next_token is [batch,1] -> [batch,1,1]
+            curr = next_token.unsqueeze(-1)
+
+            # attach next voltage (or zero)
+            v_next = volt_seq[:, t+1:t+2] if t+1<max_len else torch.zeros_like(init_token)
+            input_token = torch.cat([curr, v_next], dim=-1)
+
         # Stack outputs
         seq_preds = torch.stack(value_outputs, dim=1).squeeze(-1)
         eos_logits = torch.stack(eos_outputs, dim=1).squeeze(-1)

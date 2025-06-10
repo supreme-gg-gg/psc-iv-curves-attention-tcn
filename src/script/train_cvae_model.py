@@ -9,7 +9,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 
 # Import unified trainer and loss functions
-from src.models.iv_model_trainer import IVModelTrainer
+from src.utils.iv_model_trainer import IVModelTrainer
 from src.models.loss_functions import cvae_loss_function
 from src.models.conditional_vae import CVAEModel
 from src.utils.preprocess import preprocess_data_with_eos

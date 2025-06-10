@@ -5,7 +5,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from src.utils.preprocess import preprocess_data_with_eos
-from src.models.iv_model_trainer import IVModelTrainer
+from src.utils.iv_model_trainer import IVModelTrainer
 from src.models.loss_functions import sequence_loss_with_eos
 from src.models.rnn_seq_model import RNNIVModel
 from src.models.transformer_model import TransformerIVModel
