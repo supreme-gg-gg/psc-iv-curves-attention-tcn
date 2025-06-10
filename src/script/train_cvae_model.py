@@ -9,8 +9,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 
 # Import unified trainer and loss functions
-from src.models.iv_model_trainer import IVModelTrainer
-from src.models.loss_functions import cvae_loss_function
+from src.utils.iv_model_trainer import IVModelTrainer
+from src.utils.loss_functions import cvae_loss_function
 from src.models.conditional_vae import CVAEModel
 from src.utils.preprocess import preprocess_data_with_eos
 
@@ -52,7 +52,6 @@ def main():
     X_train_tensor, y_train_tensor, train_mask_tensor, train_length, eos_targets_train = data['train']
     X_test_tensor, y_test_tensor, test_mask_tensor, test_length, eos_targets_test = data['test']
     input_physical_scaler, output_scaler = data['scalers']
-    y_test_original_scale = data['original_test_y']
 
     # Create DataLoader instances
     train_dataset = TensorDataset(X_train_tensor, y_train_tensor, train_mask_tensor, train_length, eos_targets_train)
