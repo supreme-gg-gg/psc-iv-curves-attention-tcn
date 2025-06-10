@@ -5,8 +5,9 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from src.utils.preprocess import preprocess_data_with_eos
-from src.models.seq_model_trainer import SeqModelTrainer
-from src.models.rnn_seq_model import SeqIVModel
+from src.models.iv_model_trainer import IVModelTrainer
+from src.models.loss_functions import sequence_loss_with_eos
+from src.models.rnn_seq_model import RNNIVModel
 from src.models.transformer_model import TransformerIVModel
 
 # Data paths
@@ -74,10 +75,11 @@ def main():
             nhead=NHEAD,
             num_decoder_layers=NUM_DECODER_LAYERS,
             dropout=DROPOUT_TRANSFORMER,
-            max_sequence_length=MAX_SEQ_LEN
+            max_sequence_length=MAX_SEQ_LEN,
+            decoder_mask_ratio=0.15  # 15% denoising mask
         ).to(device)
     else:
-        model = SeqIVModel(
+        model = RNNIVModel(
             physical_dim=PHYSICAL_DIM,
             hidden_dim=HIDDEN_DIM,
             num_layers=NUM_LAYERS,
@@ -90,10 +92,16 @@ def main():
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', patience=3, factor=0.5, min_lr=1e-5
     )
-    # Trainer with EOS classifier loss
-    trainer = SeqModelTrainer(
-        model, optimizer, scheduler, device,
-        eos_loss_weight=EOS_LOSS_WEIGHT
+    # Trainer with unified interface and sequence loss function
+    trainer = IVModelTrainer(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        loss_function=sequence_loss_with_eos,
+        loss_params={
+            'eos_loss_weight': EOS_LOSS_WEIGHT
+        }
     )
 
     # Training loop with scheduled sampling and efficiency enhancements
@@ -133,7 +141,7 @@ def main():
     trainer.save_model(SAVE_PATH, data['scalers'], params)
      
     # Evaluate
-    trainer.evaluate(test_loader, data['scalers'], include_plots=True)
+    mean_r2, samples = trainer.evaluate(test_loader, data['scalers'], include_plots=True)
 
 if __name__ == "__main__":
     main()

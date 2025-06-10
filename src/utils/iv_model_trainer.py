@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 from sklearn.metrics import r2_score
 from typing import Dict, Any, Tuple, Type, Callable, Optional, List
-from iv_model_base import IVModelBase
+from src.utils.iv_model_base import IVModelBase
 import random
 import matplotlib.pyplot as plt
 

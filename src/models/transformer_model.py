@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
-from src.models.iv_model_base import IVModelBase 
+from src.utils.iv_model_base import IVModelBase 
 
 class PositionalEncoding(nn.Module):
     """
@@ -28,17 +28,34 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1), :]
 
 class TransformerIVModel(IVModelBase):
+    """
+    Transformer-based model for IV curve generation.
+    This model uses a Transformer decoder to generate IV curves from physical parameters.
+    The common practice is training transformer is with full teacher forcing with no scheduled sampling so it is implemented here.
+    During inference, it generates sequences autoregressively until an EOS token is predicted or max length is reached.
+
+    NOTE: You should set decoder_mask_ratio to zero (default) unless you have a particular reason to not do so. This is an experimental feature.
+
+    Args:
+        physical_dim (int): Dimension of the physical input features.
+        d_model (int): Dimension of the model (embedding size).
+        nhead (int): Number of attention heads in the transformer decoder.
+        num_decoder_layers (int): Number of decoder layers in the transformer.
+        dropout (float): Dropout rate for regularization.
+        max_sequence_length (int): Maximum length of the output sequence.
+        decoder_mask_ratio (float): Fraction of decoder inputs to randomly mask during training (for denoising).
+        eos_threshold (float): Threshold for EOS token prediction during inference.
+        eos_temperature (float): Temperature for scaling EOS logits during inference.
+    """
     def __init__(self, physical_dim, d_model, nhead, num_decoder_layers, dropout=0.1, 
-                 max_sequence_length=50, decoder_mask_ratio=0.0, eos_threshold=0.5, eos_temperature=1.0, scaled_zero_threshold=None, **kwargs):
+                 max_sequence_length=50, decoder_mask_ratio=0.0, eos_threshold=0.5, eos_temperature=1.0, **kwargs):
         super(TransformerIVModel, self).__init__()
         self.d_model = d_model
         self.max_sequence_length = max_sequence_length
         # fraction of decoder inputs to randomly mask during training
-        # self.decoder_mask_ratio = decoder_mask_ratio
+        self.decoder_mask_ratio = decoder_mask_ratio
         self.eos_threshold = eos_threshold
         self.eos_temperature = eos_temperature
-
-        self.scaled_zero_threshold = scaled_zero_threshold
 
         # Embeddings and encodings
         self.physical_embedding = nn.Sequential(
@@ -92,11 +109,11 @@ class TransformerIVModel(IVModelBase):
             decoder_input = self.value_embedding(decoder_input.unsqueeze(-1))
 
             # # apply random masking for denoising (BART-style)
-            # if self.training and self.decoder_mask_ratio > 0.0:
-            #     # mask per timestep with probability decoder_mask_ratio
-            #     mask_shape = decoder_input.shape[:2]  # (batch, seq)
-            #     noise_mask = torch.rand(mask_shape, device=device) < self.decoder_mask_ratio
-            #     decoder_input = decoder_input.masked_fill(noise_mask.unsqueeze(-1), 0.0)
+            if self.training and self.decoder_mask_ratio > 0.0:
+                # mask per timestep with probability decoder_mask_ratio
+                mask_shape = decoder_input.shape[:2]  # (batch, seq)
+                noise_mask = torch.rand(mask_shape, device=device) < self.decoder_mask_ratio
+                decoder_input = decoder_input.masked_fill(noise_mask.unsqueeze(-1), 0.0)
             
             # positional encoding and dropout
             decoder_input = self.pos_encoder(decoder_input)
@@ -153,17 +170,8 @@ class TransformerIVModel(IVModelBase):
                 value_outputs.append(next_token)
                 eos_outputs.append(next_eos)
                 
-                # Update finished flags based on negative values below scaled_zero_threshold
-                # NOTE: We include the next token in the generated sequence because we wnat the first negative value
-                # Still compute EOS for training purposes but don't use for truncation
-                if self.scaled_zero_threshold is not None:
-                    # Check if current token is below scaled zero threshold (indicates negative value after scaling)
-                    below_threshold = next_token < self.scaled_zero_threshold
-                    finished = finished | below_threshold.squeeze(-1)
-                else:
-                    # Fallback to EOS prediction if no scaled_zero_threshold is set
-                    eos_prob = torch.sigmoid(next_eos / self.eos_temperature)
-                    finished = finished | (eos_prob > self.eos_threshold)
+                eos_prob = torch.sigmoid(next_eos / self.eos_temperature)
+                finished = finished | (eos_prob > self.eos_threshold)
                 
                 # Stop when all sequences are finished
                 if finished.all():
@@ -204,22 +212,12 @@ class TransformerIVModel(IVModelBase):
                 seq = outputs_cpu[i]
                 eos = eos_cpu[i]
                 
-                if self.scaled_zero_threshold is not None:
-                    # Find first position where value is below scaled_zero_threshold
-                    below_threshold_positions = np.where(seq < self.scaled_zero_threshold)[0]
-                    if len(below_threshold_positions) > 0:
-                        length = int(below_threshold_positions[0]) + 1
-                    else:
-                        # If no negative values found, use full sequence
-                        length = len(seq)
+                eos_positions = np.where(eos > self.eos_threshold)[0]
+                if len(eos_positions) > 0:
+                    length = int(eos_positions[0]) + 1
                 else:
-                    # Fallback to EOS-based truncation if no scaled_zero_threshold is set
-                    eos_positions = np.where(eos > self.eos_threshold)[0]
-                    if len(eos_positions) > 0:
-                        length = int(eos_positions[0]) + 1
-                    else:
-                        # fallback to the most likely EOS position if threshold not reached
-                        length = int(np.argmax(eos)) + 1
+                    # fallback to the most likely EOS position if threshold not reached
+                    length = int(np.argmax(eos)) + 1
                 
                 lengths.append(length)
                 

@@ -1,9 +1,16 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from iv_model_base import IVModelBase
+from src.utils.iv_model_base import IVModelBase
 
 class CVAEModel(IVModelBase):
+    """
+    Conditional Variational Autoencoder (CVAE) for IV curve generation for variable length sequences.
+    1. Encode physical param + IV curve data to latent space
+    2. Decodes to generate new curves conditioned on physical parameters.
+    3. Uses reparameterization trick for sampling from latent space.
+    4. Includes an end-of-sequence (EOS) signal to handle variable-length outputs.
+    """
     def __init__(self, physical_dim, va_sweep_dim, latent_dim, output_iv_dim):
         super(CVAEModel, self).__init__()
         self.physical_dim = physical_dim

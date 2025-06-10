@@ -1,12 +1,29 @@
 import torch
 import torch.nn as nn
-from src.models.iv_model_base import IVModelBase 
+from src.utils.iv_model_base import IVModelBase 
 import random
 import numpy as np
 
-class SeqIVModel(IVModelBase):
+class RNNIVModel(IVModelBase):
+    """
+    RNN-based IV model for sequence prediction with enhanced physical feature encoding.
+    Implements a bidirectional LSTM with layer normalization and residual connections.
+    Supports both training with teacher forcing and inference with auto-regressive generation.
+    Uses a learned start token for initialization and predicts end-of-sequence (EOS) tokens.
+    Supports batch generation of IV curves with EOS detection.
+
+    Args:
+        physical_dim (int): Dimension of physical input features.
+        hidden_dim (int): Hidden dimension for LSTM and MLP layers.
+        num_layers (int): Number of LSTM layers.
+        dropout (float): Dropout rate for regularization.
+        max_sequence_length (int): Maximum length of generated sequences.
+        eos_threshold (float): Threshold for end-of-sequence (EOS) prediction.
+        **kwargs: Additional keyword arguments for future extensibility.
+    """
+
     def __init__(self, physical_dim, hidden_dim, num_layers=2, dropout=0.2, max_sequence_length=100, eos_threshold=0.5, **kwargs):
-        super(SeqIVModel, self).__init__()
+        super(RNNIVModel, self).__init__()
         self.physical_dim = physical_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
