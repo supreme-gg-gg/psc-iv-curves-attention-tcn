@@ -1,15 +1,35 @@
 import torch
 import torch.nn as nn
-from src.models.seq_model_base import SeqModelBase
+from src.utils.iv_model_base import IVModelBase 
 import random
+import numpy as np
 
-class SeqIVModel(SeqModelBase):
-    def __init__(self, physical_dim, hidden_dim, num_layers=2, dropout=0.2, max_sequence_length=100, **kwargs):
-        super(SeqIVModel, self).__init__()
+class RNNIVModel(IVModelBase):
+    """
+    RNN-based IV model for sequence prediction with enhanced physical feature encoding.
+    Implements a bidirectional LSTM with layer normalization and residual connections.
+    Supports both training with teacher forcing and inference with auto-regressive generation.
+    Uses a learned start token for initialization and predicts end-of-sequence (EOS) tokens.
+    Supports batch generation of IV curves with EOS detection.
+
+    Args:
+        physical_dim (int): Dimension of physical input features.
+        hidden_dim (int): Hidden dimension for LSTM and MLP layers.
+        num_layers (int): Number of LSTM layers.
+        dropout (float): Dropout rate for regularization.
+        max_sequence_length (int): Maximum length of generated sequences.
+        eos_threshold (float): Threshold for end-of-sequence (EOS) prediction.
+        **kwargs: Additional keyword arguments for future extensibility.
+    """
+
+    def __init__(self, physical_dim, hidden_dim, num_layers=2, dropout=0.2, max_sequence_length=100, eos_threshold=0.5, **kwargs):
+        super(RNNIVModel, self).__init__()
         self.physical_dim = physical_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.max_sequence_length = max_sequence_length
+        # threshold for EOS prediction
+        self.eos_threshold = eos_threshold
 
         # Encoder: enhanced physical features encoder with layer norm
         self.physical_enc = nn.Sequential(
@@ -141,7 +161,7 @@ class SeqIVModel(SeqModelBase):
             
             # Update finished flags based on EOS prediction
             eos_prob = torch.sigmoid(next_eos)
-            finished = finished | (eos_prob > 0.5)
+            finished = finished | (eos_prob > self.eos_threshold)
             if finished.all():
                 break
                 
@@ -172,12 +192,17 @@ class SeqIVModel(SeqModelBase):
             gen_curves = []
             lengths = []
             
+            threshold = self.eos_threshold
             for i in range(batch_size):
                 seq = outputs_cpu[i]
                 eos = eos_cpu[i]
-                # Find first position where EOS probability > 0.5
-                eos_positions = np.where(eos > 0.5)[0]
-                length = int(eos_positions[0]) + 1 if len(eos_positions) > 0 else len(seq)
+                # Find first position where EOS probability crosses threshold
+                eos_positions = np.where(eos > threshold)[0]
+                if len(eos_positions) > 0:
+                    length = int(eos_positions[0]) + 1
+                else:
+                    # fallback to most likely EOS position
+                    length = int(np.argmax(eos)) + 1
                 lengths.append(length)
                 # Convert to actual values
                 unscaled = output_scaler.inverse_transform(seq[:length].reshape(-1, 1)).flatten()

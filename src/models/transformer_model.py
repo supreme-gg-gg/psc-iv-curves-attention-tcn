@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
-from src.models.seq_model_base import SeqModelBase
+from src.utils.iv_model_base import IVModelBase 
 
 class PositionalEncoding(nn.Module):
     """
@@ -27,16 +27,41 @@ class PositionalEncoding(nn.Module):
         """
         return x + self.pe[:, :x.size(1), :]
 
-class TransformerIVModel(SeqModelBase):
-    def __init__(self, physical_dim, d_model, nhead, num_decoder_layers, dropout=0.1, max_sequence_length=100, **kwargs):
+class TransformerIVModel(IVModelBase):
+    """
+    Transformer-based model for IV curve generation.
+    This model uses a Transformer decoder to generate IV curves from physical parameters.
+    The common practice is training transformer is with full teacher forcing with no scheduled sampling so it is implemented here.
+    During inference, it generates sequences autoregressively until an EOS token is predicted or max length is reached.
+
+    NOTE: You should set decoder_mask_ratio to zero (default) unless you have a particular reason to not do so. This is an experimental feature.
+
+    Args:
+        physical_dim (int): Dimension of the physical input features.
+        d_model (int): Dimension of the model (embedding size).
+        nhead (int): Number of attention heads in the transformer decoder.
+        num_decoder_layers (int): Number of decoder layers in the transformer.
+        dropout (float): Dropout rate for regularization.
+        max_sequence_length (int): Maximum length of the output sequence.
+        decoder_mask_ratio (float): Fraction of decoder inputs to randomly mask during training (for denoising).
+        eos_threshold (float): Threshold for EOS token prediction during inference.
+        eos_temperature (float): Temperature for scaling EOS logits during inference.
+    """
+    def __init__(self, physical_dim, d_model, nhead, num_decoder_layers, dropout=0.1, 
+                 max_sequence_length=50, decoder_mask_ratio=0.0, eos_threshold=0.5, eos_temperature=1.0, **kwargs):
         super(TransformerIVModel, self).__init__()
         self.d_model = d_model
         self.max_sequence_length = max_sequence_length
+        # fraction of decoder inputs to randomly mask during training
+        self.decoder_mask_ratio = decoder_mask_ratio
+        self.eos_threshold = eos_threshold
+        self.eos_temperature = eos_temperature
 
         # Embeddings and encodings
         self.physical_embedding = nn.Sequential(
             nn.Linear(physical_dim, d_model * 2),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(d_model * 2, d_model)
         )
         self.value_embedding = nn.Linear(1, d_model)
@@ -48,7 +73,13 @@ class TransformerIVModel(SeqModelBase):
         decoder_layer = nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward=d_model * 2, dropout=dropout, batch_first=True)
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_decoder_layers)
         self.output_proj = nn.Linear(d_model, 1)
-        self.eos_head = nn.Linear(d_model, 1)  # EOS prediction head
+        # Slightly more complex EOS prediction head (2-layer MLP)
+        self.eos_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 1)
+        )
         self.start_token = nn.Parameter(torch.zeros(1))
 
     def generate_square_subsequent_mask(self, sz):
@@ -76,6 +107,15 @@ class TransformerIVModel(SeqModelBase):
             
             # Embed and add positional encoding
             decoder_input = self.value_embedding(decoder_input.unsqueeze(-1))
+
+            # # apply random masking for denoising (BART-style)
+            if self.training and self.decoder_mask_ratio > 0.0:
+                # mask per timestep with probability decoder_mask_ratio
+                mask_shape = decoder_input.shape[:2]  # (batch, seq)
+                noise_mask = torch.rand(mask_shape, device=device) < self.decoder_mask_ratio
+                decoder_input = decoder_input.masked_fill(noise_mask.unsqueeze(-1), 0.0)
+            
+            # positional encoding and dropout
             decoder_input = self.pos_encoder(decoder_input)
             decoder_input = self.dropout(decoder_input)
             
@@ -96,7 +136,7 @@ class TransformerIVModel(SeqModelBase):
             eos_logits = self.eos_head(decoder_output).squeeze(-1)
 
             return outputs, eos_logits
-        
+            
         else:
             # Inference mode - generate autoregressively with EOS prediction
             max_len = self.max_sequence_length if lengths is None else max(lengths)
@@ -130,11 +170,10 @@ class TransformerIVModel(SeqModelBase):
                 value_outputs.append(next_token)
                 eos_outputs.append(next_eos)
                 
-                # Update finished flags based on EOS prediction
-                eos_prob = torch.sigmoid(next_eos)
-                finished = finished | (eos_prob > 0.5)
-                # note that we require ALL of the sequences to finish before we stop
-                # so that it works properly with batch generation
+                eos_prob = torch.sigmoid(next_eos / self.eos_temperature)
+                finished = finished | (eos_prob > self.eos_threshold)
+                
+                # Stop when all sequences are finished
                 if finished.all():
                     break
                 
@@ -157,24 +196,29 @@ class TransformerIVModel(SeqModelBase):
         batch_size = physical_input.size(0)
         
         with torch.no_grad():
-            # Generate sequence and get EOS predictions
+            # Generate sequence and get EOS predictions (with temperature scaling)
             seq_outputs, eos_logits = self.forward(physical_input, target_seq=None)
-            eos_probs = torch.sigmoid(eos_logits)
+            eos_probs = torch.sigmoid(eos_logits / self.eos_temperature)
             
-            # Process outputs and determine lengths using EOS
+            # Process outputs and determine lengths using negative values below scaled_zero_threshold
             outputs_cpu = seq_outputs.detach().cpu().numpy()
             eos_cpu = eos_probs.detach().cpu().numpy()
             gen_curves = []
             lengths = []
-            
+
             # this loop will determine the actual length and crop each sequence in the batch
             # because during generation we generated until the longest sequence finishes
             for i in range(batch_size):
                 seq = outputs_cpu[i]
                 eos = eos_cpu[i]
-                # Find first position where EOS probability > 0.5
-                eos_positions = np.where(eos > 0.5)[0]
-                length = int(eos_positions[0]) + 1 if len(eos_positions) > 0 else len(seq)
+                
+                eos_positions = np.where(eos > self.eos_threshold)[0]
+                if len(eos_positions) > 0:
+                    length = int(eos_positions[0]) + 1
+                else:
+                    # fallback to the most likely EOS position if threshold not reached
+                    length = int(np.argmax(eos)) + 1
+                
                 lengths.append(length)
                 
                 # Convert to actual values
@@ -207,6 +251,7 @@ class TransformerIVModel(SeqModelBase):
             num_decoder_layers=params["num_decoder_layers"],
             dropout=params["dropout"],
             max_sequence_length=max_sequence_length if max_sequence_length is not None else 100,
+            scaled_zero_threshold=params.get("scaled_zero_threshold", None),
         ).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()

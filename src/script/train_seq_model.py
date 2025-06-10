@@ -5,8 +5,9 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from src.utils.preprocess import preprocess_data_with_eos
-from src.models.seq_model_trainer import SeqModelTrainer
-from src.models.rnn_seq_model import SeqIVModel
+from src.models.iv_model_trainer import IVModelTrainer
+from src.models.loss_functions import sequence_loss_with_eos
+from src.models.rnn_seq_model import RNNIVModel
 from src.models.transformer_model import TransformerIVModel
 
 # Data paths
@@ -32,7 +33,8 @@ LR = 1e-4
 TEACHER_FORCING_RATIO = 1.0
 MAX_SEQ_LEN = 50
 MIN_TF_RATIO = 0.1
-EOS_LOSS_WEIGHT = 1.0
+EOS_LOSS_WEIGHT = 2.0  # increase emphasis on EOS loss
+WARMUP_EPOCHS = 5  # epochs at full teacher forcing
 
 # Transformer hyperparameters - lightweight version
 D_MODEL = 32
@@ -73,10 +75,11 @@ def main():
             nhead=NHEAD,
             num_decoder_layers=NUM_DECODER_LAYERS,
             dropout=DROPOUT_TRANSFORMER,
-            max_sequence_length=MAX_SEQ_LEN
+            max_sequence_length=MAX_SEQ_LEN,
+            decoder_mask_ratio=0.15  # 15% denoising mask
         ).to(device)
     else:
-        model = SeqIVModel(
+        model = RNNIVModel(
             physical_dim=PHYSICAL_DIM,
             hidden_dim=HIDDEN_DIM,
             num_layers=NUM_LAYERS,
@@ -89,15 +92,27 @@ def main():
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', patience=3, factor=0.5, min_lr=1e-5
     )
-    # Trainer with EOS classifier loss
-    trainer = SeqModelTrainer(
-        model, optimizer, scheduler, device,
-        eos_loss_weight=EOS_LOSS_WEIGHT
+    # Trainer with unified interface and sequence loss function
+    trainer = IVModelTrainer(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        loss_function=sequence_loss_with_eos,
+        loss_params={
+            'eos_loss_weight': EOS_LOSS_WEIGHT
+        }
     )
 
     # Training loop with scheduled sampling and efficiency enhancements
     for epoch in range(1, EPOCHS + 1):
-        current_tf_ratio = max(MIN_TF_RATIO, TEACHER_FORCING_RATIO - (epoch - 1) / (EPOCHS - 1) * (TEACHER_FORCING_RATIO - MIN_TF_RATIO))
+        # Curriculum: full TF for warmup, then linear decay
+        if epoch <= WARMUP_EPOCHS:
+            current_tf_ratio = 1.0
+        else:
+            decay_epochs = EPOCHS - WARMUP_EPOCHS
+            decayed = (epoch - WARMUP_EPOCHS) / decay_epochs
+            current_tf_ratio = max(MIN_TF_RATIO, 1.0 - decayed * (1.0 - MIN_TF_RATIO))
 
         train_loss = trainer.train_one_epoch(train_loader, teacher_forcing_ratio=current_tf_ratio)
         val_loss = trainer.validate_one_epoch(test_loader)
@@ -126,7 +141,7 @@ def main():
     trainer.save_model(SAVE_PATH, data['scalers'], params)
      
     # Evaluate
-    trainer.evaluate(test_loader, data['scalers'], include_plots=True)
+    mean_r2, samples = trainer.evaluate(test_loader, data['scalers'], include_plots=True)
 
 if __name__ == "__main__":
     main()
