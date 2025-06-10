@@ -1,18 +1,18 @@
 """
-Unified trainer for all IV models using function pointer pattern for loss functions.
+Unified trainer for all IV models accepting any loss function.
 """
 import torch
 import torch.nn.functional as F
 import numpy as np
 from sklearn.metrics import r2_score
 from typing import Dict, Any, Tuple, Type, Callable, Optional, List
-from src.utils.iv_model_base import IVModelBase
+from iv_model_base import IVModelBase
 import random
 import matplotlib.pyplot as plt
 
 class IVModelTrainer:
     """
-    Unified trainer for all IV models using function pointer pattern for loss functions.
+    Unified trainer for all IV models accepting any loss function.
     """
     
     def __init__(self,
@@ -73,7 +73,12 @@ class IVModelTrainer:
             )
             
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)  # Gradient clipping
             self.optimizer.step()
+
+            if self.scheduler:
+                self.scheduler.step(loss.item())
+
             total_loss += loss.item() * batch_data['physical'].size(0)
         
         return total_loss / len(train_loader.dataset)
@@ -141,12 +146,12 @@ class IVModelTrainer:
                 for i in range(batch_size):
                     total_samples += 1
 
-                    true_len = lengths[i]
+                    true_len = lengths[i].item() if isinstance(lengths[i], torch.Tensor) else lengths[i]
                     true_curve = padded_seq[i, :true_len].cpu().numpy()
                     true_unscaled = output_scaler.inverse_transform(true_curve.reshape(-1, 1)).flatten()
 
                     # Get generated curve
-                    gen_len = gen_lengths[i]
+                    gen_len = gen_lengths[i] if isinstance(gen_lengths[i], (int, float)) else int(gen_lengths[i])
                     gen_curve = generated_curves[i]
 
                     # Count length mismatches
