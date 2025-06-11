@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from src.utils.iv_model_base import IVModelBase
 
+
 class CVAEModel(IVModelBase):
     """
     Conditional Variational Autoencoder (CVAE) for IV curve generation for variable length sequences.
@@ -11,6 +12,7 @@ class CVAEModel(IVModelBase):
     3. Uses reparameterization trick for sampling from latent space.
     4. Includes an end-of-sequence (EOS) signal to handle variable-length outputs.
     """
+
     def __init__(self, physical_dim, va_sweep_dim, latent_dim, output_iv_dim):
         super(CVAEModel, self).__init__()
         self.physical_dim = physical_dim
@@ -21,10 +23,7 @@ class CVAEModel(IVModelBase):
         # Encoder remains unchanged
         encoder_input_dim = physical_dim + va_sweep_dim
         self.encoder = nn.Sequential(
-            nn.Linear(encoder_input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU()
+            nn.Linear(encoder_input_dim, 64), nn.ReLU(), nn.Linear(64, 32), nn.ReLU()
         )
         self.fc_mu = nn.Linear(32, latent_dim)
         self.fc_logvar = nn.Linear(32, latent_dim)
@@ -36,17 +35,13 @@ class CVAEModel(IVModelBase):
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(128, 64),
-            nn.ReLU()
+            nn.ReLU(),
         )
         # Updated curve prediction head with linear activation for better fitting
-        self.decoder_curve = nn.Sequential(
-            nn.Linear(64, output_iv_dim)
-        )
+        self.decoder_curve = nn.Sequential(nn.Linear(64, output_iv_dim))
         # Updated EOS head with an extra hidden layer for improved EOS prediction
         self.decoder_eos = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, output_iv_dim)
+            nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, output_iv_dim)
         )
 
     def encode(self, x_physical, y_iv_curve_data):
@@ -57,9 +52,9 @@ class CVAEModel(IVModelBase):
         return self.fc_mu(h), self.fc_logvar(h)
 
     def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar) # sigma = exp(0.5 * log(sigma^2))
-        eps = torch.randn_like(std)   # Sample epsilon from N(0, I)
-        return mu + eps * std         # z = mu + epsilon * sigma
+        std = torch.exp(0.5 * logvar)  # sigma = exp(0.5 * log(sigma^2))
+        eps = torch.randn_like(std)  # Sample epsilon from N(0, I)
+        return mu + eps * std  # z = mu + epsilon * sigma
 
     def decode(self, z, x_physical):
         combined_input = torch.cat((z, x_physical), dim=1)
@@ -71,13 +66,13 @@ class CVAEModel(IVModelBase):
     def forward(self, physical, target_seq, lengths=None, teacher_forcing_ratio=None):
         """
         CVAE forward pass for training only.
-        
+
         Args:
             physical: Physical parameters (batch_size, physical_dim)
             target_seq: Target IV curves for training (required for CVAE)
             lengths: Not used for CVAE (fixed length)
             teacher_forcing_ratio: Not used for CVAE
-            
+
         Returns:
             (reconstructed_curves, eos_logits, mu, logvar)
         """
@@ -94,23 +89,23 @@ class CVAEModel(IVModelBase):
         self.eval()
         _, output_scaler = scalers
         batch_size = physical_input.size(0)
-        
+
         with torch.no_grad():
             # Sample from prior distribution for inference
             z = torch.randn(batch_size, self.latent_dim, device=physical_input.device)
             generated_curves, eos_logits = self.decode(z, physical_input)
             eos_probs = torch.sigmoid(eos_logits)
-            
+
             # Process outputs and determine lengths using EOS
             outputs_cpu = generated_curves.detach().cpu().numpy()
             eos_cpu = eos_probs.detach().cpu().numpy()
             gen_curves = []
             lengths = []
-            
+
             for i in range(batch_size):
                 seq = outputs_cpu[i]
                 eos = eos_cpu[i]
-                
+
                 # Find first position where EOS probability crosses threshold
                 eos_positions = np.where(eos > 0.5)[0]
                 if len(eos_positions) > 0:
@@ -118,13 +113,15 @@ class CVAEModel(IVModelBase):
                 else:
                     # If no EOS found, use full sequence
                     length = len(seq)
-                
+
                 lengths.append(length)
-                
+
                 # Convert to actual values
-                unscaled = output_scaler.inverse_transform(seq[:length].reshape(-1, 1)).flatten()
+                unscaled = output_scaler.inverse_transform(
+                    seq[:length].reshape(-1, 1)
+                ).flatten()
                 gen_curves.append(unscaled)
-            
+
             return gen_curves, lengths
 
     def save_model(self, save_path, scalers, params):
@@ -132,7 +129,7 @@ class CVAEModel(IVModelBase):
         save_dict = {
             "model_state_dict": self.state_dict(),
             "scalers": scalers,
-            "params": params
+            "params": params,
         }
         torch.save(save_dict, save_path)
 
@@ -145,7 +142,7 @@ class CVAEModel(IVModelBase):
             physical_dim=params["physical_dim"],
             va_sweep_dim=params["va_sweep_dim"],
             latent_dim=params["latent_dim"],
-            output_iv_dim=params["output_iv_dim"]
+            output_iv_dim=params["output_iv_dim"],
         ).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
