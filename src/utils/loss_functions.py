@@ -320,3 +320,36 @@ def physics_informed_sequence_loss(
         total = total + eos_loss_weight * eos_loss
 
     return total
+
+
+def fixed_length_mse_loss(
+    outputs: torch.Tensor,
+    targets: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    lengths: Optional[torch.Tensor] = None,
+    physics_weight: float = 0.1,
+    **kwargs,
+) -> torch.Tensor:
+    """
+    Simple MSE loss for fixed-length IV curve prediction with optional physics constraints.
+
+    Args:
+        outputs: Predicted IV curves (batch_size, fixed_length)
+        targets: Target IV curves (batch_size, fixed_length)
+        mask: Not used for fixed-length but kept for interface compatibility
+        lengths: Not used for fixed-length but kept for interface compatibility
+        physics_weight: Weight for physics constraints
+
+    Returns:
+        Combined loss value
+    """
+    # Basic MSE loss
+    mse_loss = F.mse_loss(outputs, targets)
+
+    # Optional physics constraints
+    if physics_weight > 0.0:
+        mono_loss, smooth_loss = physics_constraints_loss(outputs)
+        physics_loss = physics_weight * (mono_loss + smooth_loss)
+        return mse_loss + physics_loss
+
+    return mse_loss
