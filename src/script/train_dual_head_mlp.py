@@ -26,12 +26,15 @@ def dual_head_loss_standalone(
     current_weight=0.8,
     voltage_weight=0.2,
     physics_weight=0.1,
+    initial_weight=0.5,
 ):
     """
     Standalone dual-head loss function.
     """
     # Current prediction loss (MSE)
     current_loss = F.mse_loss(current_pred, current_targets)
+    # Initial point (Isc) loss
+    initial_loss = F.mse_loss(current_pred[:, 0], current_targets[:, 0])
 
     # Voltage prediction loss (MSE)
     voltage_loss = F.mse_loss(voltage_pred, voltage_targets)
@@ -55,7 +58,10 @@ def dual_head_loss_standalone(
 
     # Combined loss
     total_loss = (
-        current_weight * current_loss + voltage_weight * voltage_loss + physics_loss
+        current_weight * current_loss
+        + voltage_weight * voltage_loss
+        + physics_weight * physics_loss
+        + initial_weight * initial_loss
     )
 
     return total_loss, current_loss, voltage_loss, physics_loss
@@ -75,6 +81,7 @@ class DualHeadTrainerStandalone:
         current_weight=0.8,
         voltage_weight=0.2,
         physics_weight=0.1,
+        initial_weight=0.5,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -83,6 +90,7 @@ class DualHeadTrainerStandalone:
         self.current_weight = current_weight
         self.voltage_weight = voltage_weight
         self.physics_weight = physics_weight
+        self.initial_weight = initial_weight
 
     def train_one_epoch(self, train_loader):
         """Train for one epoch."""
@@ -113,6 +121,7 @@ class DualHeadTrainerStandalone:
                     self.current_weight,
                     self.voltage_weight,
                     self.physics_weight,
+                    self.initial_weight,
                 )
             )
 
@@ -155,6 +164,7 @@ class DualHeadTrainerStandalone:
                     self.current_weight,
                     self.voltage_weight,
                     self.physics_weight,
+                    self.initial_weight,
                 )
 
                 total_loss += total_loss_batch.item()
@@ -320,6 +330,7 @@ def main():
     CURRENT_WEIGHT = 0.8
     VOLTAGE_WEIGHT = 0.2
     PHYSICS_WEIGHT = 0.1
+    INITIAL_WEIGHT = 0.5
     HIDDEN_DIMS = [128, 64, 64]
 
     # Fixed-length preprocessing parameters
@@ -400,6 +411,7 @@ def main():
         current_weight=CURRENT_WEIGHT,
         voltage_weight=VOLTAGE_WEIGHT,
         physics_weight=PHYSICS_WEIGHT,
+        initial_weight=INITIAL_WEIGHT,
     )
 
     # Training loop

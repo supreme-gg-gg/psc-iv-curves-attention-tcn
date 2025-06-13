@@ -39,9 +39,11 @@ class BaselineMLP(IVModelBase):
 
         self.net_base = nn.Sequential(*layers)
 
-        # Separate heads: one for current prediction, one for voltage positions
-        self.current_head = nn.Linear(prev_dim, output_dim)
-        self.voltage_head = nn.Linear(prev_dim, output_dim)
+        # one head for both
+        self.output_head = nn.Sequential(
+            nn.Linear(prev_dim, output_dim * 2),  # output_dim for current + voltage
+            nn.Sigmoid()  # Both current and voltage in [0, 1]
+        )
 
     def forward(
         self,
@@ -65,8 +67,14 @@ class BaselineMLP(IVModelBase):
         # Shared encoding
         hidden = self.net_base(physical)
         # Predict current and voltage positions
-        curr_pred = self.current_head(hidden)
-        volt_pred = self.voltage_head(hidden)
+        output = self.output_head(hidden)
+
+        batch_size = output.size(0)
+        # Split output into current and voltage predictions
+        output = output.view(batch_size, self.output_dim, 2)
+        curr_pred = output[:, :, 0]  # Current predictions
+        volt_pred = output[:, :, 1]  # Voltage predictions 
+
         # Return both heads
         return curr_pred, volt_pred
 

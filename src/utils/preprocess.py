@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler, MinMaxScaler
-from scalers import GlobalISCScaler, GlobalVocScaler
+from src.utils.scalers import GlobalValueScaler
 import matplotlib.pyplot as plt
 from torch.nn.utils.rnn import pad_sequence
 
@@ -58,7 +58,7 @@ def preprocess_data_with_eos(
     filtered_train = [filter_curve(curve) for curve in y_train_raw]
 
     # Fit GlobalISCScaler on all ISC values from training data
-    output_scaler = GlobalISCScaler(method=isc_scaler_method)
+    output_scaler = GlobalValueScaler(method=isc_scaler_method)
     train_isc_values = np.array([curve[0] for curve in filtered_train])
     output_scaler.fit(train_isc_values)
 
@@ -406,12 +406,12 @@ def preprocess_fixed_length_dual_output(
     isc_train, isc_test = isc_vals[idx_train], isc_vals[idx_test]
 
     # Scale current values
-    isc_scaler = GlobalISCScaler(method=isc_scaler_method)
+    isc_scaler = GlobalValueScaler(method='max', value_type="isc")
     Y_current_train_scaled = isc_scaler.fit_transform(Y_current_train)
     Y_current_test_scaled = isc_scaler.transform(Y_current_test)
 
-    # Scale voltage values using GlobalVocScaler
-    voltage_scaler = GlobalVocScaler(method=voc_scaler_method)
+    # Scale voltage values
+    voltage_scaler = GlobalValueScaler(method='max', value_type="voc")
     V_voltage_train_scaled = voltage_scaler.fit_transform(V_voltage_train)
     V_voltage_test_scaled = voltage_scaler.transform(V_voltage_test)
 
@@ -546,7 +546,7 @@ def preprocess_fixed_length_common_axis(
     Y_train_original, Y_test_original = Y_reduced[idx_train], Y_reduced[idx_test]
     isc_train, isc_test = isc_vals[idx_train], isc_vals[idx_test]
 
-    isc_scaler = GlobalISCScaler(method=isc_scaler_method)
+    isc_scaler = GlobalValueScaler(method=isc_scaler_method)
     # Fit on training data only
     Y_train_scaled = isc_scaler.fit_transform(Y_train_original)
     Y_test_scaled = isc_scaler.transform(Y_test_original)
@@ -741,8 +741,8 @@ if __name__ == "__main__":
         train_input_paths,
         train_output_paths,
         "preprocess_fixed_length_dual_output",
-        num_pre=5,
-        num_post=6,
+        num_pre=10,
+        num_post=11,
         high_res_points=10000,
         round_digits=2,
         test_size=0.2,
