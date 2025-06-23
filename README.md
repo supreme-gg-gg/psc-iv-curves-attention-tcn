@@ -10,13 +10,13 @@ Refer to `explanation_of_data.pdf` for details on the dataset. Make sure you hav
 
 ## Running the Code
 
-The train and inference scripts are located in the `src` directory. Run them as follows:
+The train and inference scripts are located in the `script` directory. Run them as follows:
 
 ```bash
-python -m src.script.your_script_name
+python -m script.your_script_name
 ```
 
-Trying to run the scripts directly (e.g., `python src/script/your_script_name.py`) will not work due to the way the modules are structured (might be changed in the future).
+Trying to run the scripts directly (e.g., `python script/your_script_name.py`) will not work due to the way the modules are structured (might be changed in the future).
 
 ## Preprocessing
 
