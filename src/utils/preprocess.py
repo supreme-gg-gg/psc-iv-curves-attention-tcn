@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler, MinMaxScaler
-from src.utils.scalers import GlobalValueScaler
+from scalers import GlobalValueScaler
 import matplotlib.pyplot as plt
 from torch.nn.utils.rnn import pad_sequence
 
@@ -57,18 +57,17 @@ def preprocess_data_with_eos(
     # Process training IV curves
     filtered_train = [filter_curve(curve) for curve in y_train_raw]
 
-    # Fit GlobalISCScaler on all ISC values from training data
-    output_scaler = GlobalValueScaler(method=isc_scaler_method)
-    train_isc_values = np.array([curve[0] for curve in filtered_train])
-    output_scaler.fit(train_isc_values)
+    # Fit MinMaxScaler on all current values from training data
+    output_scaler = MinMaxScaler()
+    all_train_values = np.concatenate(filtered_train)
+    output_scaler.fit(all_train_values.reshape(-1, 1))
 
-    # Apply GlobalISCScaler and prepare EOS token targets
     scaled_train_std = []
     eos_targets_train = []
     lengths_train = []
 
     for curve in filtered_train:
-        scaled_curve = output_scaler.transform(curve)
+        scaled_curve = output_scaler.transform(curve.reshape(-1, 1)).flatten()
         scaled_train_std.append(scaled_curve)
 
         # EOS token target: mark EOS at the last actual data point (inclusive)
@@ -97,7 +96,7 @@ def preprocess_data_with_eos(
     lengths_test = []
 
     for curve in filtered_test:
-        scaled_curve = output_scaler.transform(curve)
+        scaled_curve = output_scaler.transform(curve.reshape(-1, 1)).flatten()
         scaled_test_std.append(scaled_curve)
 
         # mark EOS at last data point
@@ -121,10 +120,10 @@ def preprocess_data_with_eos(
     # Create masks for padded sequences (train & test)
     mask_train = torch.zeros_like(padded_y_train)
     mask_test = torch.zeros_like(padded_y_test)
-    for i, l in enumerate(lengths_train):
-        mask_train[i, :l] = 1.0
-    for i, l in enumerate(lengths_test):
-        mask_test[i, :l] = 1.0
+    for i, length in enumerate(lengths_train):
+        mask_train[i, :length] = 1.0
+    for i, length in enumerate(lengths_test):
+        mask_test[i, :length] = 1.0
 
     # Preprocess input features: logarithm transform then RobustScaler
     X_train_log = np.log10(X_train_raw + epsilon)
@@ -150,7 +149,6 @@ def preprocess_data_with_eos(
     print(f"Train EOS targets: {padded_eos_targets_train.shape}")
     print(f"Test sequences: {padded_y_test.shape}")
     print(f"Test EOS targets: {padded_eos_targets_test.shape}")
-    print(f"Global ISC value: {output_scaler.get_isc():.4f}")
 
     return {
         "train": (
@@ -304,8 +302,6 @@ def preprocess_fixed_length_dual_output(
     current_thresh=None,
     round_digits=None,
     test_size=0.2,
-    isc_scaler_method="median",
-    voc_scaler_method="median",
 ):
     """
     Standalone preprocessing for dual-head models.
@@ -406,12 +402,12 @@ def preprocess_fixed_length_dual_output(
     isc_train, isc_test = isc_vals[idx_train], isc_vals[idx_test]
 
     # Scale current values
-    isc_scaler = GlobalValueScaler(method='max', value_type="isc")
+    isc_scaler = GlobalValueScaler(method="max", value_type="isc")
     Y_current_train_scaled = isc_scaler.fit_transform(Y_current_train)
     Y_current_test_scaled = isc_scaler.transform(Y_current_test)
 
     # Scale voltage values
-    voltage_scaler = GlobalValueScaler(method='max', value_type="voc")
+    voltage_scaler = GlobalValueScaler(method="max", value_type="voc")
     V_voltage_train_scaled = voltage_scaler.fit_transform(V_voltage_train)
     V_voltage_test_scaled = voltage_scaler.transform(V_voltage_test)
 
@@ -442,6 +438,8 @@ def preprocess_fixed_length_dual_output(
         "scalers": (isc_scaler, input_scaler, voltage_scaler),
         "original_test_y": Y_current_test,
         "original_test_v": V_voltage_test,
+        "test_indices": np.array(idx_test),  # Original indices of test samples
+        "filtered_indices": np.array(idxs),  # Indices of samples that passed filtering
     }
 
 
@@ -712,30 +710,6 @@ def test_and_visualize_preprocessing(
 if __name__ == "__main__":
     train_input_paths = ["dataset/Data_1k_sets/Data_1k_rng1/LHS_parameters_m.txt"]
     train_output_paths = ["dataset/Data_1k_sets/Data_1k_rng1/iV_m.txt"]
-
-    # Test all preprocessing functions
-    # test_and_visualize_preprocessing(
-    #     preprocess_data_with_eos,
-    #     train_input_paths,
-    #     train_output_paths,
-    #     "preprocess_data_with_eos",
-    #     test_size=0.2,
-    #     isc_scaler_method="median",
-    # )
-
-    # test_and_visualize_preprocessing(
-    #     preprocess_fixed_length_common_axis,
-    #     train_input_paths,
-    #     train_output_paths,
-    #     "preprocess_fixed_length_common_axis",
-    #     num_pre=5,
-    #     num_post=6,
-    #     high_res_points=10000,
-    #     round_digits=2,
-    #     test_size=0.2,
-    #     isc_scaler_method="median",
-    # )
-
     test_and_visualize_preprocessing(
         preprocess_fixed_length_dual_output,
         train_input_paths,

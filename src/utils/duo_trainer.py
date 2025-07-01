@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score
-from dual_loss import enhanced_dual_output_loss, minimal_dual_output_loss
+from src.utils.duo_loss import enhanced_dual_output_loss, minimal_dual_output_loss
 
 
 # Re-using the R2 calculation from the MLP trainer example
