@@ -1,11 +1,10 @@
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import RobustScaler, MinMaxScaler
+from scalers import GlobalValueScaler
 import matplotlib.pyplot as plt
-import seaborn as sns
 from torch.nn.utils.rnn import pad_sequence
-import random
 
 
 def load_data(file_paths):
@@ -14,9 +13,11 @@ def load_data(file_paths):
     return np.vstack(data)
 
 
-def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
+def preprocess_data_with_eos(
+    input_paths, output_paths, test_size=0.2, isc_scaler_method="median"
+):
     """
-    Filters out negative values, applies scaling.
+    Filters out negative values, applies scaling using GlobalISCScaler.
     Pads IV curves to allow batching of variable-length sequences.
     NOTE: We pad with -1.0 to differentiate from actual data.
     Constructs EOS targets for each sequence, marking the end of the actual data.
@@ -56,12 +57,11 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
     # Process training IV curves
     filtered_train = [filter_curve(curve) for curve in y_train_raw]
 
-    # Fit StandardScaler on all scaled values
-    output_scaler = RobustScaler()
+    # Fit MinMaxScaler on all current values from training data
+    output_scaler = MinMaxScaler()
     all_train_values = np.concatenate(filtered_train)
     output_scaler.fit(all_train_values.reshape(-1, 1))
 
-    # Apply StandardScaler and prepare EOS token targets
     scaled_train_std = []
     eos_targets_train = []
     lengths_train = []
@@ -120,10 +120,10 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
     # Create masks for padded sequences (train & test)
     mask_train = torch.zeros_like(padded_y_train)
     mask_test = torch.zeros_like(padded_y_test)
-    for i, l in enumerate(lengths_train):
-        mask_train[i, :l] = 1.0
-    for i, l in enumerate(lengths_test):
-        mask_test[i, :l] = 1.0
+    for i, length in enumerate(lengths_train):
+        mask_train[i, :length] = 1.0
+    for i, length in enumerate(lengths_test):
+        mask_test[i, :length] = 1.0
 
     # Preprocess input features: logarithm transform then RobustScaler
     X_train_log = np.log10(X_train_raw + epsilon)
@@ -144,7 +144,7 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
     print(
         f"Test  - min: {min(lengths_test)}, max: {max(lengths_test)}, mean: {np.mean(lengths_test):.1f}"
     )
-    print(f"\nTarget shapes after padding:")
+    print("\nTarget shapes after padding:")
     print(f"Train sequences: {padded_y_train.shape}")
     print(f"Train EOS targets: {padded_eos_targets_train.shape}")
     print(f"Test sequences: {padded_y_test.shape}")
@@ -167,6 +167,7 @@ def preprocess_data_with_eos(input_paths, output_paths, test_size=0.2):
         ),
         "scalers": (input_scaler, output_scaler),
         "original_test_y": filtered_test,
+        "original_train_y": filtered_train,
         "max_sequence_length": max(max_len_train_actual, max_len_test_actual),
     }
 
@@ -214,7 +215,7 @@ def preprocess_data_no_eos(input_paths, output_paths, test_size=0.2, return_mask
     lengths_test = [len(curve) for curve in filtered_test]
 
     # Fit scaler on all data when test_size=1.0, otherwise just on training data
-    output_scaler = RobustScaler()
+    output_scaler = MinMaxScaler()
     if test_size == 1.0:
         all_values = np.concatenate(filtered_test)
     else:
@@ -291,107 +292,434 @@ def preprocess_data_no_eos(input_paths, output_paths, test_size=0.2, return_mask
     }
 
 
-if __name__ == "__main__":
-    train_input_paths = [
-        "../../dataset/Data_10k_sets/Data_10k_rng1/LHS_parameters_m.txt",
-        "../../dataset/Data_10k_sets/Data_10k_rng2/LHS_parameters_m.txt",
-        "../../dataset/Data_10k_sets/Data_10k_rng3/LHS_parameters_m.txt",
-    ]
+def preprocess_fixed_length_dual_output(
+    input_paths,
+    output_paths,
+    voltage_raw=None,
+    num_pre=5,
+    num_post=6,
+    high_res_points=10000,
+    current_thresh=None,
+    round_digits=None,
+    test_size=0.2,
+):
+    """
+    Standalone preprocessing for dual-head models.
+    NOTE: THIS ASSUMES THAT YOU ARE TRAINING A MODEL WITH TWO OUTPUT HEADS FOR CURRENT AND VOLTAGE.
+    If you want to only output current, consider preprocess_fixed_length_common_axis instead.
+    Preprocessing with only fixed length doesn't make sense for either use case because its voltage axis is different and not scaled.
+    Returns both current and voltage targets as separate tensors.
+    """
+    # Load and stack data
+    X_data = load_data(input_paths)
+    y_data = load_data(output_paths)
 
-    train_output_paths = [
-        "../../dataset/Data_10k_sets/Data_10k_rng1/iV_m.txt",
-        "../../dataset/Data_10k_sets/Data_10k_rng2/iV_m.txt",
-        "../../dataset/Data_10k_sets/Data_10k_rng3/iV_m.txt",
-    ]
+    # Default voltage grid if not provided
+    if voltage_raw is None:
+        voltage_raw = np.concatenate(
+            (np.arange(0, 0.41, 0.1), np.arange(0.425, 1.401, 0.025))
+        )
 
-    # Process data using the new sequential preprocessing
-    data = preprocess_data_no_eos(
-        train_input_paths, train_output_paths, return_masks=False
+    # High-res axis
+    hi_V = np.linspace(voltage_raw.min(), voltage_raw.max(), high_res_points)
+
+    def _reduce(curve):
+        # High-res interpolation
+        y_hi = np.interp(hi_V, voltage_raw, curve)
+
+        # Voc (zero-cross)
+        neg = np.where(y_hi < 0)[0]
+        if len(neg) > 0:
+            i0 = neg[0]
+            V1 = hi_V[i0 - 1]
+            V2 = hi_V[i0]
+            y1 = y_hi[i0 - 1]
+            y2 = y_hi[i0]
+            Voc = V1 - y1 * (V2 - V1) / (y2 - y1)
+        else:
+            Voc = hi_V[-1]
+
+        # MPP
+        P = hi_V * y_hi
+        mpp = np.argmax(P)
+        Vmp = hi_V[mpp]
+
+        # Sample grids
+        v_pre = np.linspace(0, Vmp, num_pre)
+        v_post = np.linspace(Vmp, Voc, num_post)
+
+        # Values
+        y_pre = np.interp(v_pre, hi_V, y_hi)
+        y_post = np.interp(v_post, hi_V, y_hi)
+
+        # Drop duplicate Vmp
+        v_red = np.concatenate((v_pre, v_post[1:]))
+        y_red = np.concatenate((y_pre, y_post[1:]))
+        return v_red, y_red
+
+    v_list, y_list, idxs = [], [], []
+    for idx, curve in enumerate(y_data):
+        v_red, y_red = _reduce(curve)
+
+        # Outlier filter
+        if current_thresh is not None:
+            if np.nanmax(y_red) > current_thresh or np.nanmin(y_red) < -1:
+                continue
+
+        # Rounding
+        if round_digits is not None:
+            y_red = np.round(y_red, round_digits)
+
+        v_list.append(v_red)
+        y_list.append(y_red)
+        idxs.append(idx)
+
+    if not y_list:
+        raise ValueError("No curves left after filtering")
+
+    X_clean = X_data[idxs]
+    Y_current_reduced = np.vstack(y_list)  # Physical current values
+    V_voltage_reduced = np.vstack(v_list)  # Physical voltage positions
+
+    isc_vals = Y_current_reduced[:, 0]
+
+    # Split indices first
+    indices = np.arange(len(X_clean))
+    idx_train, idx_test = train_test_split(
+        indices, test_size=test_size, random_state=42
     )
-    (X_train_tensor, padded_y_train, lengths_train) = data["train"]
-    (X_test_tensor, padded_y_test, lengths_test) = data["test"]
-    input_scaler, output_scaler = data["scalers"]
-    filtered_test = data["original_test_y"]
 
-    # Print basic statistics
-    print("\nData Shape Summary:")
-    print(f"X_train: {X_train_tensor.shape}")
-    print(f"Padded y_train: {padded_y_train.shape}")
-    print(f"X_test: {X_test_tensor.shape}")
-    print(f"Padded y_test: {padded_y_test.shape}")
-    print("\nSequence lengths:")
-    print(f"Train - min: {min(lengths_train)}, max: {max(lengths_train)}")
-    print(f"Test - min: {min(lengths_test)}, max: {max(lengths_test)}")
+    # Split all data
+    X_train_raw, X_test_raw = X_clean[idx_train], X_clean[idx_test]
+    Y_current_train, Y_current_test = (
+        Y_current_reduced[idx_train],
+        Y_current_reduced[idx_test],
+    )
+    V_voltage_train, V_voltage_test = (
+        V_voltage_reduced[idx_train],
+        V_voltage_reduced[idx_test],
+    )
+    isc_train, isc_test = isc_vals[idx_train], isc_vals[idx_test]
 
-    # Create visualization plots
-    plt.figure(figsize=(15, 10))
+    # Scale current values
+    isc_scaler = GlobalValueScaler(method="max", value_type="isc")
+    Y_current_train_scaled = isc_scaler.fit_transform(Y_current_train)
+    Y_current_test_scaled = isc_scaler.transform(Y_current_test)
 
-    # Input feature distributions
-    plt.subplot(2, 2, 1)
-    sns.boxplot(data=X_train_tensor.numpy())
-    plt.title("Distribution of Scaled Input Features")
-    plt.xticks(rotation=45)
+    # Scale voltage values
+    voltage_scaler = GlobalValueScaler(method="max", value_type="voc")
+    V_voltage_train_scaled = voltage_scaler.fit_transform(V_voltage_train)
+    V_voltage_test_scaled = voltage_scaler.transform(V_voltage_test)
 
-    # Original IV curves (few samples)
-    plt.subplot(2, 2, 2)
-    for i in range(5):
-        plt.plot(filtered_test[i], alpha=0.7, label=f"Sample {i + 1}")
-    plt.title("Sample Original IV Curves (Test)")
-    plt.xlabel("Index")
-    plt.ylabel("Current Density (A/m^2)")
-    plt.legend()
+    # Process input features
+    epsilon = 1e-40
+    X_train_log = np.log10(X_train_raw + epsilon)
+    input_scaler = RobustScaler(quantile_range=(5, 95))
+    X_train_scaled = input_scaler.fit_transform(X_train_log)
+    X_test_log = np.log10(X_test_raw + epsilon)
+    X_test_scaled = input_scaler.transform(X_test_log)
 
-    # Scaled and padded IV curves
-    plt.subplot(2, 2, 3)
-    for i in range(5):
-        valid_length = lengths_test[i]
-        curve = padded_y_test[i, :valid_length]
-        plt.plot(curve.numpy(), alpha=0.7, label=f"Sample {i + 1}")
-    plt.title("Scaled & Padded IV Curves (Test)")
-    plt.xlabel("Index")
-    plt.ylabel("Scaled Current")
-    plt.legend()
+    # Convert to tensors
+    X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
+    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
+    Y_current_train_tensor = torch.tensor(Y_current_train_scaled, dtype=torch.float32)
+    Y_current_test_tensor = torch.tensor(Y_current_test_scaled, dtype=torch.float32)
+    V_voltage_train_tensor = torch.tensor(V_voltage_train_scaled, dtype=torch.float32)
+    V_voltage_test_tensor = torch.tensor(V_voltage_test_scaled, dtype=torch.float32)
 
-    # Sequence length distribution
-    plt.subplot(2, 2, 4)
-    plt.hist(lengths_train, bins=30, alpha=0.5, label="Train")
-    plt.hist(lengths_test, bins=30, alpha=0.5, label="Test")
-    plt.title("Distribution of Sequence Lengths")
-    plt.xlabel("Length")
-    plt.ylabel("Count")
-    plt.legend()
+    return {
+        "train": (
+            X_train_tensor,
+            Y_current_train_tensor,
+            V_voltage_train_tensor,
+            isc_train,
+        ),
+        "test": (X_test_tensor, Y_current_test_tensor, V_voltage_test_tensor, isc_test),
+        "scalers": (isc_scaler, input_scaler, voltage_scaler),
+        "original_test_y": Y_current_test,
+        "original_test_v": V_voltage_test,
+        "test_indices": np.array(idx_test),  # Original indices of test samples
+        "filtered_indices": np.array(idxs),  # Indices of samples that passed filtering
+    }
+
+
+def preprocess_fixed_length_common_axis(
+    input_paths,
+    output_paths,
+    voltage_raw=None,
+    num_pre=3,
+    num_post=4,
+    high_res_points=10000,
+    current_thresh=None,
+    round_digits=None,
+    test_size=0.2,
+    isc_scaler_method="median",
+):
+    """
+    This function is identical to preprocess_fixed_length, but it uses a common voltage grid
+    for all curves, allowing for direct comparison of IV curves across different samples.
+    High res interpolation (upsampling) -> downsampling to fixed length -> interp to common grid.
+
+    Returns:
+        Dictionary with:
+        - 'train': (X_train_tensor, Y_train_tensor, isc_train)
+        - 'test': (X_test_tensor, Y_test_tensor, isc_test)
+        - 'scalers': (isc_scaler, input_scaler)
+        - 'v_common': common voltage grid for all curves
+        - 'original_test_y': original test curves in physical units
+    """
+    # load and stack data
+    X_data = load_data(input_paths)
+    y_data = load_data(output_paths)
+
+    # default voltage grid if not provided
+    if voltage_raw is None:
+        voltage_raw = np.concatenate(
+            (np.arange(0, 0.41, 0.1), np.arange(0.425, 1.401, 0.025))
+        )
+    # high-res axis
+    hi_V = np.linspace(voltage_raw.min(), voltage_raw.max(), high_res_points)
+    # common fixed voltage grid for all curves
+    v_common = np.linspace(voltage_raw.min(), voltage_raw.max(), num_pre + num_post - 1)
+
+    def _reduce(curve):
+        # high-res interpolation
+        y_hi = np.interp(hi_V, voltage_raw, curve)
+        # Voc (zero-cross)
+        neg = np.where(y_hi < 0)[0]
+        if len(neg) > 0:
+            i0 = neg[0]
+            V1 = hi_V[i0 - 1]
+            V2 = hi_V[i0]
+            y1 = y_hi[i0 - 1]
+            y2 = y_hi[i0]
+            Voc = V1 - y1 * (V2 - V1) / (y2 - y1)
+        else:
+            Voc = hi_V[-1]
+        # MPP
+        P = hi_V * y_hi
+        mpp = np.argmax(P)
+        Vmp = hi_V[mpp]
+        # sample grids
+        v_pre = np.linspace(0, Vmp, num_pre)
+        v_post = np.linspace(Vmp, Voc, num_post)
+        # values
+        y_pre = np.interp(v_pre, hi_V, y_hi)
+        y_post = np.interp(v_post, hi_V, y_hi)
+        # drop duplicate Vmp
+        v_red = np.concatenate((v_pre, v_post[1:]))
+        y_red = np.concatenate((y_pre, y_post[1:]))
+        return v_red, y_red
+
+    y_list, idxs = [], []
+    for idx, curve in enumerate(y_data):
+        v_red, y_red = _reduce(curve)
+        # outlier filter
+        if current_thresh is not None:
+            if np.nanmax(y_red) > current_thresh or np.nanmin(y_red) < -1:
+                continue
+        # rounding
+        if round_digits is not None:
+            y_red = np.round(y_red, round_digits)
+        # resample onto common fixed grid
+        y_fixed = np.interp(v_common, v_red, y_red)
+        y_list.append(y_fixed)
+        idxs.append(idx)
+
+    if not y_list:
+        raise ValueError("No curves left after filtering")
+    X_clean = X_data[idxs]
+    Y_reduced = np.vstack(y_list)  # physical current values
+
+    isc_vals = Y_reduced[:, 0]
+
+    # Split indices first
+    indices = np.arange(len(X_clean))
+    idx_train, idx_test = train_test_split(
+        indices, test_size=test_size, random_state=42
+    )
+
+    # Split all data
+    X_train_raw, X_test_raw = X_clean[idx_train], X_clean[idx_test]
+    Y_train_original, Y_test_original = Y_reduced[idx_train], Y_reduced[idx_test]
+    isc_train, isc_test = isc_vals[idx_train], isc_vals[idx_test]
+
+    isc_scaler = GlobalValueScaler(method=isc_scaler_method)
+    # Fit on training data only
+    Y_train_scaled = isc_scaler.fit_transform(Y_train_original)
+    Y_test_scaled = isc_scaler.transform(Y_test_original)
+
+    # Process input features
+    epsilon = 1e-40
+    X_train_log = np.log10(X_train_raw + epsilon)
+    input_scaler = RobustScaler(quantile_range=(5, 95))
+    X_train_scaled = input_scaler.fit_transform(X_train_log)
+    X_test_log = np.log10(X_test_raw + epsilon)
+    X_test_scaled = input_scaler.transform(X_test_log)
+
+    # Convert to tensors
+    X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
+    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
+    Y_train_tensor = torch.tensor(Y_train_scaled, dtype=torch.float32)
+    Y_test_tensor = torch.tensor(Y_test_scaled, dtype=torch.float32)
+
+    return {
+        "train": (X_train_tensor, Y_train_tensor, isc_train),
+        "test": (X_test_tensor, Y_test_tensor, isc_test),
+        "scalers": (isc_scaler, input_scaler),
+        "v_common": v_common,
+        "original_test_y": Y_test_original,  # physical curves
+    }
+
+
+# NOTE: This is very inefficient but we need to wait until the third major refactoring to improve this ig...
+def test_and_visualize_preprocessing(
+    preprocess_func, input_paths, output_paths, func_name, num_samples=5, **kwargs
+):
+    """
+    Generic function to test and visualize any preprocessing function.
+
+    Args:
+        preprocess_func: Function pointer to the preprocessing function
+        input_paths: List of input file paths
+        output_paths: List of output file paths
+        func_name: Name of the function for display purposes
+        num_samples: Number of samples to plot
+        **kwargs: Additional arguments to pass to the preprocessing function
+    """
+    print(f"\nTesting {func_name}:")
+
+    # Call the preprocessing function
+    data = preprocess_func(input_paths, output_paths, **kwargs)
+
+    # Handle different return formats
+    if func_name == "preprocess_data_with_eos":
+        X_train, y_train, _, _, _ = data["train"]
+        scalers = data["scalers"]
+        original_data = data["original_train_y"]
+        scaler = scalers[1]  # output scaler
+
+        # Plot EOS data
+        plt.figure(figsize=(12, 6))
+
+        # Scaled curves
+        plt.subplot(1, 2, 1)
+        for i in range(min(num_samples, len(y_train))):
+            length = len(original_data[i])
+            scaled_curve = y_train[i, :length].numpy()
+            plt.plot(scaled_curve, label=f"Sample {i + 1}")
+        plt.title(f"{func_name} - Scaled Curves")
+        plt.xlabel("Index")
+        plt.ylabel("Scaled Current")
+        plt.legend()
+        plt.grid(True)
+
+        # Original curves
+        plt.subplot(1, 2, 2)
+        for i in range(min(num_samples, len(original_data))):
+            plt.plot(original_data[i], label=f"Sample {i + 1}")
+        plt.title(f"{func_name} - Original Curves")
+        plt.xlabel("Index")
+        plt.ylabel("Current Density (A/m²)")
+        plt.legend()
+        plt.grid(True)
+
+    elif func_name == "preprocess_fixed_length_common_axis":
+        X_train, y_train, _ = data["train"]
+        scalers = data["scalers"]
+        v_common = data["v_common"]
+        scaler = scalers[0]  # isc_scaler
+
+        plt.figure(figsize=(12, 6))
+
+        # Scaled curves
+        plt.subplot(1, 2, 1)
+        for i in range(min(num_samples, len(y_train))):
+            scaled_curve = y_train[i].numpy()
+            plt.plot(v_common, scaled_curve, label=f"Sample {i + 1}")
+        plt.title(f"{func_name} - Scaled Curves")
+        plt.xlabel("Voltage (V)")
+        plt.ylabel("Scaled Current")
+        plt.legend()
+        plt.grid(True)
+
+        # Original curves
+        plt.subplot(1, 2, 2)
+        for i in range(min(num_samples, len(y_train))):
+            original_curve = scaler.inverse_transform(
+                y_train[i].numpy().reshape(-1, 1)
+            ).flatten()
+            plt.plot(v_common, original_curve, label=f"Sample {i + 1}")
+        plt.title(f"{func_name} - Original Curves")
+        plt.xlabel("Voltage (V)")
+        plt.ylabel("Current Density (A/m²)")
+        plt.legend()
+        plt.grid(True)
+
+    elif func_name == "preprocess_fixed_length_dual_output":
+        X_train, y_current_train, v_voltage_train, _ = data["train"]
+        isc_scaler, _, voltage_scaler = data["scalers"]
+
+        plt.figure(figsize=(12, 6))
+
+        # Scaled IV curves
+        plt.subplot(1, 2, 1)
+        for i in range(min(num_samples, len(y_current_train))):
+            scaled_current = y_current_train[i].numpy()
+            scaled_voltage = v_voltage_train[i].numpy()
+            plt.plot(scaled_voltage, scaled_current, label=f"Sample {i + 1}")
+        plt.title(f"{func_name} - Scaled IV Curves")
+        plt.xlabel("Scaled Voltage [0,1]")
+        plt.ylabel("Scaled Current [-1,1]")
+        plt.legend()
+        plt.grid(True)
+
+        # Original IV curves
+        plt.subplot(1, 2, 2)
+        for i in range(min(num_samples, len(y_current_train))):
+            current = isc_scaler.inverse_transform(
+                y_current_train[i].numpy().reshape(1, -1)
+            ).flatten()
+            voltage = voltage_scaler.inverse_transform(
+                v_voltage_train[i].numpy().reshape(1, -1)
+            ).flatten()
+            plt.plot(voltage, current, label=f"Sample {i + 1}")
+        plt.title(f"{func_name} - Original IV Curves")
+        plt.xlabel("Voltage (V)")
+        plt.ylabel("Current Density (A/m²)")
+        plt.legend()
+        plt.grid(True)
 
     plt.tight_layout()
     plt.show()
 
-    # Print ranges for quality check
-    print("\nData Quality Checks:")
-    print(f"Input range: [{X_train_tensor.min():.2f}, {X_train_tensor.max():.2f}]")
-    print(
-        f"Scaled IV range (excluding padding): [{padded_y_train[padded_y_train != 0].min():.2f}, {padded_y_train[padded_y_train != 0].max():.2f}]"
-    )
+    # Print summary statistics
+    print("Data shapes:")
+    print(f"  X_train: {X_train.shape}")
+    if func_name == "preprocess_fixed_length_dual_output":
+        print(f"  Y_current_train: {y_current_train.shape}")
+        print(f"  V_voltage_train: {v_voltage_train.shape}")
+        print(f"  Global ISC: {isc_scaler.get_isc():.4f}")
+        print(f"  Global Voc: {voltage_scaler.get_voc():.4f}")
+    else:
+        print(f"  Y_train: {y_train.shape}")
+        if hasattr(scaler, "get_isc"):
+            print(f"  Global ISC: {scaler.get_isc():.4f}")
 
-    # plot original vs new IV curve and the point of EOS
-    sample_idx = random.randint(0, len(filtered_test))
-    plt.figure(figsize=(10, 6))
-    original_curve = filtered_test[sample_idx]
-    scaled_curve = padded_y_test[sample_idx, : lengths_test[sample_idx]].numpy()
-    unscaled_curve = output_scaler.inverse_transform(
-        scaled_curve.reshape(-1, 1)
-    ).flatten()
 
-    plt.plot(original_curve, label="Original Curve", linestyle="--")
-    plt.plot(unscaled_curve, label="New Curve (Unscaled)", alpha=0.7)
-    plt.title(f"Original vs. New IV Curve (Sample {sample_idx + 1})")
-    plt.xlabel("Index")
-    plt.ylabel("Current Density (A/m^2)")
-    plt.legend()
-    plt.grid(True)
-    plt.axvline(
-        x=lengths_test[sample_idx] - 1,
-        color="red",
-        linestyle=":",
-        label=f"Crop Point (Index {lengths_test[sample_idx] - 1})",
+if __name__ == "__main__":
+    train_input_paths = ["dataset/Data_1k_sets/Data_1k_rng1/LHS_parameters_m.txt"]
+    train_output_paths = ["dataset/Data_1k_sets/Data_1k_rng1/iV_m.txt"]
+    test_and_visualize_preprocessing(
+        preprocess_fixed_length_dual_output,
+        train_input_paths,
+        train_output_paths,
+        "preprocess_fixed_length_dual_output",
+        num_pre=10,
+        num_post=11,
+        high_res_points=10000,
+        round_digits=2,
+        test_size=0.2,
+        isc_scaler_method="median",
+        voc_scaler_method="median",
     )
-    plt.legend()
-    plt.show()
