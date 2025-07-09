@@ -47,6 +47,40 @@ PARAM_COLNAMES = [
     "other_loss",
 ]
 
+COLNAMES_INTERP_MODEL = [
+    "lH",
+    "lP",
+    "lE",
+    "muHh",
+    "muPh",
+    "muPe",
+    "muEe",
+    "NvH",
+    "NcH",
+    "NvE",
+    "NcE",
+    "NvP",
+    "NcP",
+    "chiHh",
+    "chiHe",
+    "chiPh",
+    "chiPe",
+    "chiEh",
+    "chiEe",
+    "Wlm",
+    "Whm",
+    "epsH",
+    "epsP",
+    "epsE",
+    "Gavg",
+    "Aug",
+    "Brad",
+    "Taue",
+    "Tauh",
+    "vII",
+    "vIII",
+]
+
 
 @dataclass
 class LossWeights:

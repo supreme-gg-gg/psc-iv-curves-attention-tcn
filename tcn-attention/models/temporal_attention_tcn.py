@@ -2,8 +2,6 @@
 """
 Temporal attention (i.e. masked multihead attention) with a TCN.
 NOTE: Adapted from https://github.com/haohy/TCAN/tree/master
-
-(Version 9: Corrected TCAN architecture, faithfully replicating author's causal conv and dilation).
 """
 
 import numpy as np

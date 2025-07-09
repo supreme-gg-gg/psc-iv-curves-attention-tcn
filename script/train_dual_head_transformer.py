@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 from src.utils.preprocess import preprocess_fixed_length_dual_output
 from src.models.duo_transformer import TransformerDualOutputIVModel
-from src.utils.duo_trainer import DualOutputTransformerTrainer
+from src.utils.iv_model_trainer import DualOutputIVModelTrainer
 
 
 def main():
@@ -104,7 +104,7 @@ def main():
     )
 
     # Initialize trainer
-    trainer = DualOutputTransformerTrainer(
+    trainer = DualOutputIVModelTrainer(
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,

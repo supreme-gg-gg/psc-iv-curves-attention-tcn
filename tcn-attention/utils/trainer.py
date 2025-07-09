@@ -345,3 +345,253 @@ class ModelTrainer:
         """
         self.model.load_state_dict(torch.load(filename, map_location=self.device))
         print(f"Model weights loaded from {filename}")
+
+
+def physics_loss(
+    y_pred: torch.Tensor, y_true: torch.Tensor, sample_w: torch.Tensor, loss_w: dict
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Calculates the total physics-informed loss (from another_model.py)."""
+    mse_loss = (((y_true - y_pred) ** 2) * sample_w).mean()
+    mono_violations = torch.relu(y_pred[:, 1:] - y_pred[:, :-1])
+    mono_loss = mono_violations.pow(2).mean()
+    convex_violations = torch.relu(y_pred[:, :-2] - 2 * y_pred[:, 1:-1] + y_pred[:, 2:])
+    convex_loss = convex_violations.pow(2).mean()
+    curvature = torch.abs(y_pred[:, :-2] - 2 * y_pred[:, 1:-1] + y_pred[:, 2:])
+    excurv_violations = torch.relu(curvature - loss_w["excess_threshold"])
+    excurv_loss = excurv_violations.pow(2).mean()
+    total_loss = (
+        loss_w["mse"] * mse_loss
+        + loss_w["mono"] * mono_loss
+        + loss_w["convex"] * convex_loss
+        + loss_w["excurv"] * excurv_loss
+    )
+    return total_loss, {
+        "mse": mse_loss,
+        "mono": mono_loss,
+        "convex": convex_loss,
+        "excurv": excurv_loss,
+    }
+
+
+class InterpModelTrainer:
+    """Trainer for fixed-length sequence models"""
+
+    def __init__(
+        self, model: nn.Module, cfg: dict, warmup_steps: int, total_steps: int
+    ):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = model.to(self.device)
+        self.cfg = cfg
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+
+        # Setup optimizer
+        opt_cfg = cfg["optimizer"]
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=opt_cfg["lr"],
+            weight_decay=opt_cfg["weight_decay"],
+        )
+
+        # Setup scheduler
+        final_lr = opt_cfg["lr"] * opt_cfg["final_lr_ratio"]
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer,
+            start_factor=1e-7,
+            end_factor=1.0,
+            total_iters=self.warmup_steps,
+        )
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=self.total_steps - self.warmup_steps,
+            eta_min=final_lr,
+        )
+        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+            self.optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[self.warmup_steps],
+        )
+
+        self.history = {"train_loss": [], "val_loss": []}
+        self.best_model_state_dict = None
+
+    def train(self, dataloaders: dict, epochs: int):
+        """Train the model."""
+        train_loader, val_loader = dataloaders["train"], dataloaders["val"]
+        print(f"=== Starting Training on {self.device} for {epochs} epochs ===")
+
+        best_val_loss = float("inf")
+        for epoch in range(epochs):
+            self.model.train()
+            train_loss = self._run_epoch(train_loader, is_training=True)
+            self.history["train_loss"].append(train_loss)
+
+            self.model.eval()
+            with torch.no_grad():
+                val_loss = self._run_epoch(val_loader, is_training=False)
+            self.history["val_loss"].append(val_loss)
+
+            print(
+                f"Epoch {epoch + 1}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | LR: {self.optimizer.param_groups[0]['lr']:.2e}"
+            )
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                self.best_model_state_dict = self.model.state_dict()
+                print(f"  -> New best validation loss: {best_val_loss:.6f}")
+
+        self.plot_training_history()
+
+    def evaluate(self, test_loader: DataLoader):
+        """Evaluate the model."""
+        print("=== Evaluating Model on Test Set ===")
+        if self.best_model_state_dict:
+            self.model.load_state_dict(self.best_model_state_dict)
+        self.model.eval()
+
+        y_true_flat, y_pred_flat = [], []
+        with torch.no_grad():
+            for batch in test_loader:
+                batch_data = {
+                    "X_combined": batch["X_combined"].to(self.device),
+                    "voltage": batch["voltage"].to(self.device),
+                    "current_scaled": batch["current_scaled"].to(self.device),
+                    "sample_w": batch["sample_w"].to(self.device),
+                    "isc": batch["isc"].to(self.device),
+                }
+
+                y_pred = self.model(batch_data["X_combined"], batch_data["voltage"])
+
+                # Denormalize predictions
+                for i in range(y_pred.shape[0]):
+                    isc = batch_data["isc"][i].item()
+                    y_true_flat.extend(
+                        0.5 * (batch_data["current_scaled"][i].cpu() + 1) * isc
+                    )
+                    y_pred_flat.extend(0.5 * (y_pred[i].cpu() + 1) * isc)
+
+        metrics = {
+            "MAE": mean_absolute_error(y_true_flat, y_pred_flat),
+            "RMSE": np.sqrt(mean_squared_error(y_true_flat, y_pred_flat)),
+            "R2_Score": r2_score(y_true_flat, y_pred_flat),
+        }
+        print(f"Evaluation Metrics: {metrics}")
+        return metrics
+
+    def _run_epoch(self, data_loader, is_training):
+        """Run one epoch."""
+        total_loss, num_batches = 0.0, 0
+
+        for batch in data_loader:
+            batch_data = {
+                "X_combined": batch["X_combined"].to(self.device),
+                "voltage": batch["voltage"].to(self.device),
+                "current_scaled": batch["current_scaled"].to(self.device),
+                "sample_w": batch["sample_w"].to(self.device),
+                "isc": batch["isc"].to(self.device),
+            }
+
+            if is_training:
+                self.optimizer.zero_grad()
+
+            y_pred = self.model(batch_data["X_combined"], batch_data["voltage"])
+
+            loss, _ = physics_loss(
+                y_pred,
+                batch_data["current_scaled"],
+                batch_data["sample_w"],
+                self.cfg["model"]["loss_weights"],
+            )
+
+            if torch.isnan(loss):
+                print("NaN loss detected. Skipping batch update.")
+                continue
+
+            if is_training:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                self.scheduler.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+
+        return total_loss / num_batches if num_batches > 0 else 0.0
+
+    def plot_training_history(self):
+        """Plot training history."""
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.history["train_loss"], label="Train Loss")
+        plt.plot(self.history["val_loss"], label="Validation Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Training History")
+        plt.yscale("log")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig("training_history_another.png")
+        plt.close()
+        print("Training history plot saved to training_history_another.png")
+
+    def plot_results(self, test_loader, n_samples=8):
+        """Plot prediction results."""
+        print(f"Plotting {n_samples} sample predictions...")
+        if self.best_model_state_dict:
+            self.model.load_state_dict(self.best_model_state_dict)
+        self.model.eval()
+
+        batch = next(iter(test_loader))
+        batch_data = {
+            "X_combined": batch["X_combined"].to(self.device),
+            "voltage": batch["voltage"].to(self.device),
+            "current_scaled": batch["current_scaled"].to(self.device),
+            "isc": batch["isc"].to(self.device),
+        }
+
+        with torch.no_grad():
+            y_pred = self.model(batch_data["X_combined"], batch_data["voltage"])
+            y_pred = y_pred.cpu()
+
+        idxs = random.sample(
+            range(len(batch_data["X_combined"])),
+            min(n_samples, len(batch_data["X_combined"])),
+        )
+        fig, axes = plt.subplots(
+            len(idxs), 1, figsize=(8, 4 * len(idxs)), squeeze=False
+        )
+
+        for i, idx in enumerate(idxs):
+            v_plot = batch_data["voltage"][idx].cpu()
+            y_true = batch_data["current_scaled"][idx].cpu()
+            y_pred_curve = y_pred[idx]
+            isc = batch_data["isc"][idx].item()
+
+            y_true_phys = 0.5 * (y_true + 1) * isc
+            y_pred_phys = 0.5 * (y_pred_curve + 1) * isc
+
+            ax = axes[i, 0]
+            ax.plot(v_plot, y_true_phys, "k-", label="Ground Truth", lw=2)
+            ax.plot(v_plot, y_pred_phys, "r--", label="Predicted", lw=2)
+            ax.set(
+                ylabel="Current Density (A/m^2)",
+                xlabel="Voltage (V)",
+                title=f"Test Sample Index {idx}",
+            )
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig("prediction_examples_another.png", dpi=300)
+        plt.close(fig)
+        print("Prediction examples plot saved to prediction_examples_another.png")
+
+    def save_model(self, filename="model_another.pth"):
+        """Save the model's state_dict to a file."""
+        torch.save(self.model.state_dict(), filename)
+        print(f"Model weights saved to {filename}")
+
+    def load_model(self, filename="model_another.pth"):
+        """Load the model's state_dict from a file."""
+        self.model.load_state_dict(torch.load(filename, map_location=self.device))
+        print(f"Model weights loaded from {filename}")

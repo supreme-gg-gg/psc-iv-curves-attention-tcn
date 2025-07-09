@@ -12,7 +12,7 @@ from src.utils.preprocess import preprocess_data_with_eos
 from src.models.rnn_seq_model import RNNIVModel
 from src.utils.loss_functions import (
     physics_informed_sequence_loss,
-)  # use physics loss via trainer
+)
 from src.utils.iv_model_trainer import IVModelTrainer
 
 # ========== User settings ==========

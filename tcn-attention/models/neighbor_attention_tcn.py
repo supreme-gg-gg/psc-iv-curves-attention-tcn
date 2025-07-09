@@ -3,7 +3,7 @@
 Combining causal dilated neighbour attention with a TCN.
 Adapted from https://github.com/alexmehta/NAC-TCN-TCNs-with-Causal-NA/tree/main
 
-(Version 11: Adapted to use Neighborhood Attention TCN).
+You need to first install natten: pip install natten
 """
 
 import numpy as np

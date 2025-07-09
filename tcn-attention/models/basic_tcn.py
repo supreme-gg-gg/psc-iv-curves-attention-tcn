@@ -7,8 +7,6 @@ This is not supported natively in PyTorch Conv1d, but if you use Keras you can j
 A very similar alternative approach is on PyTorch Forum: https://discuss.pytorch.org/t/causal-convolution/3456/4
 However, we here use the official original implementation from the TCN paper authors (Bai et. al.)
 from this open-source repo: https://github.com/locuslab/TCN/blob/master/TCN/tcn.py
-
-(Version 7: Final, stable, and readable).
 """
 
 import numpy as np
