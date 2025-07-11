@@ -1,6 +1,6 @@
 # PSC IV Curves Reconstruction with Attention TCN
 
-This repo contains experiment code for the paper "Reconstruion of IV Characteristics of Perovskite Solar Cells using Physics-Informed Temporal Convolution Attention Networks" (will be published soon).
+This repo contains experiment code for the paper "Reconstruction of IV Characteristics of Perovskite Solar Cells using Physics-Informed Temporal Convolution Attention Networks" (will be published soon).
 
 This is not the official code for the paper, which is available [in this repo instead](https://github.com/memo-ozdincer/PINN-iV-curve-reconstruction) by my partner. The official repo contains up-to-date code, results, and a more detailed writeup.
 
@@ -70,4 +70,4 @@ For now refer to the offical code repo for a detailed explanation.
 
 ## Citation
 
-You should cite the official code repo. This research work is done by Jet Chiang and Memo Ozdincer from University of Toronto, under supervision of Prof. Erik Birgersson from National University of Singapore.
+You should cite the official code repo. This research work is done by Jet Chiang and Memo Ozdincer from University of Toronto, under supervision by Prof. Erik Birgersson from National University of Singapore.
